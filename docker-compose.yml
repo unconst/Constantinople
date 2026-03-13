@@ -1,0 +1,97 @@
+# Constantinople — Subnet 97 Production Deployment
+#
+# Validator discovers miners from chain metagraph and sets weights.
+# Watchtower auto-pulls new images every 5 minutes.
+#
+# Usage:
+#   cp .env.example .env  # edit with your settings
+#   docker compose up -d
+#
+# Wallet must be mounted from host: ~/.bittensor/wallets
+
+services:
+  # ── Hardened Gateway Validator ─────────────────────────────
+  validator:
+    build: ./validator
+    image: ${IMAGE_PREFIX:-constantinople}-validator:latest
+    container_name: constantinople-validator
+    restart: unless-stopped
+
+    command: >
+      --discover
+      --wallet ${WALLET_NAME:-validator}
+      --hotkey ${HOTKEY_NAME:-default}
+      --netuid 97
+      --network finney
+      --port 8080
+      --epoch-length ${EPOCH_LENGTH:-300}
+      --synthetic-interval ${SYNTHETIC_INTERVAL:-10}
+      --model ${VALIDATOR_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      --api-keys ${API_KEYS:-}
+      --monitoring-keys ${MONITORING_KEYS:-}
+
+    ports:
+      - "${VALIDATOR_PORT:-8080}:8080"
+
+    volumes:
+      - ${WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      - r2-audit:/tmp/r2-audit
+      - validator-data:/app/data
+      - huggingface-cache:/root/.cache/huggingface
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    environment:
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
+      - R2_ENDPOINT=${R2_ENDPOINT:-}
+      - R2_ACCESS_KEY=${R2_ACCESS_KEY:-}
+      - R2_SECRET_KEY=${R2_SECRET_KEY:-}
+      - R2_BUCKET=${R2_BUCKET:-constantinople-audit}
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ── Watchtower — Auto-Update ───────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: constantinople-watchtower
+    restart: unless-stopped
+
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_ROLLING_RESTART=true
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  r2-audit:
+  validator-data:
+  huggingface-cache:
