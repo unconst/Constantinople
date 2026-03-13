@@ -1,0 +1,51 @@
+# Inference Subnet — Miner (GPU)
+# Runs real model inference with hidden state caching
+#
+# Build:  docker build -f Dockerfile.miner -t inference-subnet-miner .
+# Run:    docker run --gpus all -p 8091:8091 inference-subnet-miner --model Qwen/Qwen2.5-1.5B-Instruct
+#
+# For mock mode (no GPU):
+#   docker run -p 8091:8091 inference-subnet-miner --mock
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    aiohttp \
+    numpy \
+    pydantic \
+    torch \
+    transformers \
+    accelerate
+
+# Copy application code
+COPY model.py multi_gpu_miner.py real_miner.py ./
+
+# Entrypoint script to select mock vs real mode
+COPY <<'EOF' /app/entrypoint.sh
+#!/bin/bash
+set -e
+if [ "$1" = "--mock" ]; then
+    shift
+    exec python3 multi_gpu_miner.py "$@"
+else
+    exec python3 real_miner.py "$@"
+fi
+EOF
+RUN chmod +x /app/entrypoint.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=120s \
+    CMD curl -f http://localhost:8091/health || exit 1
+
+EXPOSE 8091
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["--port", "8091", "--model", "Qwen/Qwen2.5-1.5B-Instruct"]

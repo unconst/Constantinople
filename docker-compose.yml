@@ -1,0 +1,141 @@
+# Constantinople — Decentralized LLM Inference Subnet (SN97)
+#
+# Validator deployment with Watchtower auto-updates.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in values
+#   2. Ensure wallet files are at ~/.bittensor/wallets/ (or set WALLET_PATH)
+#   3. docker compose up -d
+#   4. Watchtower auto-pulls new images every 5 minutes
+
+services:
+  # ── Gateway Validator ─────────────────────────────────────────────
+  validator:
+    image: ${IMAGE_PREFIX:-unconst/constantinople}-validator:latest
+    container_name: constantinople-validator
+    restart: unless-stopped
+    pull_policy: always
+
+    environment:
+      - EPOCH_LENGTH=${EPOCH_LENGTH:-300}
+      - SYNTHETIC_INTERVAL=${SYNTHETIC_INTERVAL:-10}
+      - R2_ENDPOINT=${R2_ENDPOINT:-}
+      - R2_ACCESS_KEY=${R2_ACCESS_KEY:-}
+      - R2_SECRET_KEY=${R2_SECRET_KEY:-}
+      - R2_BUCKET=${R2_BUCKET:-constantinople-audit}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
+
+    command: >
+      --discover
+      --netuid 97
+      --wallet ${WALLET_NAME:-validator}
+      --hotkey ${HOTKEY_NAME:-default}
+      --network finney
+      --port 8080
+      --model ${VALIDATOR_MODEL:-mock}
+      --epoch-length ${EPOCH_LENGTH:-300}
+      --synthetic-interval ${SYNTHETIC_INTERVAL:-10}
+
+    ports:
+      - "${VALIDATOR_PORT:-8080}:8080"
+
+    volumes:
+      - ${WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      - r2-audit:/tmp/r2-audit
+      - validator-data:/app/data
+      - huggingface-cache:/root/.cache/huggingface
+
+    # GPU access for real model verification (optional)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ── Miner (GPU) ──────────────────────────────────────────────────
+  miner:
+    image: ${IMAGE_PREFIX:-unconst/constantinople}-miner:latest
+    container_name: constantinople-miner
+    restart: unless-stopped
+    pull_policy: always
+    profiles: ["miner"]
+
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}
+      - CACHE_SIZE=${CACHE_SIZE:-200}
+
+    command: ["--port", "8091", "--model", "${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}"]
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ports:
+      - "${MINER_PORT:-8091}:8091"
+
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ── Watchtower — Auto-Update ─────────────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_ROLLING_RESTART=true
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  r2-audit:
+  validator-data:
+  huggingface-cache:

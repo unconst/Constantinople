@@ -1,0 +1,50 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  VALIDATOR_IMAGE: unconst/constantinople-validator
+  MINER_IMAGE: unconst/constantinople-miner
+
+jobs:
+  build-validator:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.validator
+          push: true
+          tags: ${{ env.VALIDATOR_IMAGE }}:latest,${{ env.VALIDATOR_IMAGE }}:${{ github.sha }}
+
+  build-miner:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.miner
+          push: true
+          tags: ${{ env.MINER_IMAGE }}:latest,${{ env.MINER_IMAGE }}:${{ github.sha }}

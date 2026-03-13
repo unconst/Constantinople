@@ -1,0 +1,59 @@
+# Inference Subnet — Hardened Gateway Validator
+# Exploit-resistant inference routing, scoring, and chain weight setting.
+# OpenAI-compatible API at /v1/chat/completions
+#
+# Mock mode (no GPU):
+#   docker build -f Dockerfile.validator -t inference-subnet-validator .
+#   docker run -p 8080:8080 inference-subnet-validator --miners http://miner:8091
+#
+# Real model mode (GPU required):
+#   docker build -f Dockerfile.validator --build-arg GPU=1 -t inference-subnet-validator:gpu .
+#   docker run --gpus all -p 8080:8080 inference-subnet-validator:gpu \
+#     --miners http://miner:8091 --model Qwen/Qwen2.5-1.5B-Instruct
+
+ARG GPU=0
+
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS base-gpu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir torch transformers accelerate
+
+FROM python:3.12-slim AS base-cpu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM base-cpu AS select-0
+FROM base-gpu AS select-1
+FROM select-${GPU} AS final
+
+WORKDIR /app
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    aiohttp \
+    numpy \
+    pydantic \
+    boto3 \
+    bittensor
+
+# Copy hardened application code
+COPY model.py ./
+COPY hardened_scoring.py ./
+COPY challenge_engine.py ./
+COPY hardened_gateway.py ./
+COPY r2_publisher.py ./
+COPY kv_cache_prober.py ./
+COPY collusion_detector.py ./
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD curl -f http://localhost:8080/v1/health || exit 1
+
+EXPOSE 8080
+
+ENTRYPOINT ["python3", "hardened_gateway.py"]
+CMD ["--miners", "http://miner:8091", "--port", "8080"]

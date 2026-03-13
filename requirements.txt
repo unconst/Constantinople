@@ -1,0 +1,21 @@
+# Core dependencies (validator + miner)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0
+aiohttp>=3.9.0
+numpy>=1.24.0
+
+# Miner: model inference
+torch>=2.0.0
+transformers>=4.35.0
+
+# Validator: chain integration (optional — only needed for real chain)
+# bittensor>=9.0.0
+
+# Validator: R2 audit publishing (optional — falls back to local files)
+# boto3>=1.28.0
+
+# Testing
+httpx>=0.25.0
+pytest>=7.0
+pytest-asyncio>=0.21.0
