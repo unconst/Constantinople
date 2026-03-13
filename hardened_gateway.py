@@ -3248,6 +3248,12 @@ async def run_gateway(args):
 
     model = load_validator_model(getattr(args, 'model', None))
 
+    # Auto-disable challenges when using mock model (hidden states won't match real miners)
+    model_name = getattr(args, 'model', None)
+    if not model_name or model_name == "mock":
+        log.warning("Using mock model — disabling hidden state challenges (speed-only scoring)")
+        config.CHALLENGE_RATE = 0.0
+
     # Chain integration (optional)
     chain = None
     if args.wallet:

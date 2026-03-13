@@ -56,4 +56,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
 EXPOSE 8080
 
 ENTRYPOINT ["python3", "hardened_gateway.py"]
-CMD ["--miners", "http://miner:8091", "--port", "8080"]
+CMD ["--discover", "--wallet", "validator", "--hotkey", "default", "--netuid", "97", "--network", "finney", "--port", "8080"]
