@@ -52,6 +52,7 @@ class AlertState:
     last_challenge_fail_count: int = 0
     alert_cooldown_s: float = 300.0  # 5 min cooldown between same alerts
     history: list = field(default_factory=list)  # Recent health snapshots
+    per_miner_alert_time: dict = field(default_factory=dict)  # uid -> last alert time
 
 
 class GatewayMonitor:
@@ -243,18 +244,30 @@ class GatewayMonitor:
 
         # ── Alert: Latency degradation (from per-miner details) ──
         miners_detail = health.get("miners_detail", [])
+        now = time.time()
         for m in miners_detail:
             uid = m.get("uid", "?")
+            alive = m.get("alive", True)
             ttft = m.get("avg_ttft_ms", 0)
             tps = m.get("avg_tps", 0)
             reliability = m.get("reliability", 1.0)
 
-            if ttft > 2000:  # TTFT > 2 seconds is bad
+            # Skip dead miners — they're already tracked by the miner-drop alert
+            if not alive:
+                continue
+
+            # Per-miner cooldown to avoid spamming Telegram
+            last_miner_alert = self.state.per_miner_alert_time.get(uid, 0)
+            miner_can_alert = (now - last_miner_alert) >= self.state.alert_cooldown_s
+
+            if ttft > 2000 and miner_can_alert:  # TTFT > 2 seconds is bad
+                self.state.per_miner_alert_time[uid] = now
                 self._send_alert(
                     f"Miner {uid}: high TTFT={ttft:.0f}ms (>2s threshold)",
                     "WARN",
                 )
-            if reliability < 0.5:  # Below 50% reliability
+            if reliability < 0.5 and miner_can_alert:  # Below 50% reliability
+                self.state.per_miner_alert_time[uid] = now
                 self._send_alert(
                     f"Miner {uid}: low reliability={reliability:.0%} (<50%)",
                     "WARN",

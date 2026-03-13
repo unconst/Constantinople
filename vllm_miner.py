@@ -139,6 +139,7 @@ class VLLMMiner:
         gpu_memory_utilization: float = 0.85,
         cache_size: int = 200,
         hf_device: str = "auto",
+        enforce_eager: bool = False,
     ):
         self.model_name = model_name
         self.cache = HiddenStateCache(max_requests=cache_size)
@@ -162,6 +163,7 @@ class VLLMMiner:
             trust_remote_code=True,
             dtype="float16",
             disable_log_stats=True,
+            enforce_eager=enforce_eager,
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.SamplingParams = SamplingParams
@@ -667,6 +669,12 @@ def main():
         choices=["auto", "cpu"],
         help="Device for HF hidden state model: 'auto' tries GPU then CPU, 'cpu' forces CPU (default: auto)",
     )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=False,
+        help="Disable CUDA graph capture for vLLM (slower but avoids compilation hangs)",
+    )
     args = parser.parse_args()
 
     # Graceful shutdown
@@ -686,6 +694,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         cache_size=args.cache_size,
         hf_device=args.hf_device,
+        enforce_eager=args.enforce_eager,
     )
 
     log.info(f"Starting vLLM miner on {args.host}:{args.port}")

@@ -161,7 +161,7 @@ class ChainWeightSetter:
         self.total_sets = 0
         self.total_failures = 0
 
-    async def set_weights(self, weights: dict[int, float], retries: int = 1) -> bool:
+    async def set_weights(self, weights: dict[int, float], retries: int = 3) -> bool:
         """Set weights on chain via subprocess with retry. Returns True on success."""
         if not weights:
             log.warning("[CHAIN] No weights to set")
@@ -2222,7 +2222,12 @@ class HardenedGatewayValidator:
 
             # Set weights on chain if configured
             if self.chain and summary["weights"]:
-                await self.chain.set_weights(summary["weights"])
+                success = await self.chain.set_weights(summary["weights"])
+                summary["weights_committed"] = success
+                if success:
+                    log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
+                else:
+                    log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
 
             return summary
         return None
