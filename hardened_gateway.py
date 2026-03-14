@@ -626,9 +626,11 @@ class IntelligentRouter:
     Intelligent request routing across miners.
 
     Routing strategy:
-    1. If session has affinity → prefer that miner (KV cache reuse)
-    2. Otherwise → weighted random by (reliability × speed × availability)
-    3. Fallback → least loaded miner
+    1. Skip miners blocked by scoring (negative points, low pass_rate)
+    2. If session has affinity → prefer that miner (KV cache reuse)
+    3. Otherwise → weighted random by (reliability × speed × availability)
+       where speed = 0.4 * TTFT_score + 0.6 * TPS_score
+    4. Fallback → least loaded miner
 
     Anti-gaming: Routing decisions are not predictable by miners.
     The routing weights use cryptographic randomness and are
@@ -639,32 +641,83 @@ class IntelligentRouter:
         self.miners = miners
         self.session_router = SessionRouter()
         self._reliability_ema_alpha = 0.1  # Slow EMA for reliability
+        self._blocked_uids: set[int] = set()  # UIDs blocked by scoring engine
+        self._auditor_blocked: set[int] = set()  # UIDs blocked by external auditor
+
+    def update_blocked_uids(self, scoring_engine):
+        """Update blocked UIDs from local scoring engine — merges with auditor blocks."""
+        local_blocked = set()
+        for entry in scoring_engine.get_scoreboard():
+            uid = entry["uid"]
+            net_points = entry.get("net_points", 0)
+            pass_rate = entry.get("pass_rate", 1.0)
+            total_challenged = entry.get("passed_challenges", 0) + entry.get("failed_challenges", 0)
+            # Block miners with negative net_points (confirmed cheaters)
+            if net_points < 0:
+                local_blocked.add(uid)
+            # Block miners with low pass_rate and enough samples
+            elif total_challenged >= 4 and pass_rate < 0.7:
+                local_blocked.add(uid)
+        merged = local_blocked | self._auditor_blocked
+        if merged != self._blocked_uids:
+            log.info(f"[ROUTER] Blocked UIDs updated: {merged} (local={local_blocked}, auditor={self._auditor_blocked})")
+        self._blocked_uids = merged
+
+    def update_auditor_blocked(self, blocked_uids: set[int]):
+        """Update blocked UIDs from external auditor — persists across local resets."""
+        self._auditor_blocked = blocked_uids
+        merged = self._blocked_uids | blocked_uids
+        if merged != self._blocked_uids:
+            log.info(f"[ROUTER] Blocked UIDs updated from auditor: {merged}")
+        self._blocked_uids = merged
+
+    def _compute_speed_factor(self, m: MinerInfo) -> float:
+        """Combined speed factor: 40% TTFT + 60% TPS (matches validator scoring)."""
+        # TTFT score: lower is better, normalize to [0, 1]
+        TTFT_EXCELLENT_MS = 200.0
+        TTFT_POOR_MS = 2000.0
+        if m.avg_ttft_ms > 0:
+            ttft_score = max(0.05, min(1.0, 1.0 - (m.avg_ttft_ms - TTFT_EXCELLENT_MS) /
+                                                     (TTFT_POOR_MS - TTFT_EXCELLENT_MS)))
+        else:
+            ttft_score = 0.5  # Unknown TTFT — neutral
+
+        # TPS score: higher is better
+        tps_score = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+
+        return 0.4 * ttft_score + 0.6 * tps_score
 
     def select_miner(self, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select the best miner for a request."""
         # Snapshot to avoid RuntimeError if discovery_loop modifies dict concurrently
-        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive}
+        # Exclude blocked UIDs (negative scorers, low pass_rate)
+        alive_miners = {uid: m for uid, m in list(self.miners.items())
+                        if m.alive and uid not in self._blocked_uids}
+        if not alive_miners:
+            # Fallback: try all alive miners if blocking leaves none
+            alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive}
         if not alive_miners:
             return None
 
-        # Session affinity — only honour if miner is responsive and not overloaded
+        # Session affinity — only honour if miner is responsive, fast, and not overloaded
         if session_id:
             affinity_uid = self.session_router.get_affinity(session_id)
             if affinity_uid is not None and affinity_uid in alive_miners:
                 miner = alive_miners[affinity_uid]
-                # Lower threshold (5 vs 10) to prevent session-locking by slow miners
-                if miner.active_requests < 5 and miner.reliability_score > 0.3:
+                if (miner.active_requests < 5 and
+                    miner.reliability_score > 0.7 and
+                    (miner.avg_ttft_ms <= 0 or miner.avg_ttft_ms < 1000)):
                     return miner
 
-        # Weighted selection based on reliability and load
+        # Weighted selection based on reliability, load, and speed (TTFT + TPS)
         weights = []
         miner_list = list(alive_miners.values())
         for m in miner_list:
-            # Weight = reliability × inverse_load × speed_factor
             load_factor = 1.0 / (1.0 + m.active_requests)
-            speed_factor = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+            speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
-            weights.append(max(w, 0.01))  # Minimum weight to prevent starvation
+            # Only add positive weights — no minimum floor for cheaters
+            weights.append(max(w, 0.001))
 
         total_w = sum(weights)
         if total_w == 0:
@@ -711,7 +764,11 @@ class IntelligentRouter:
 
     def select_miner_excluding(self, exclude_uids: set, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select a miner excluding specific UIDs (used for failover)."""
-        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in exclude_uids}
+        all_excluded = exclude_uids | self._blocked_uids
+        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in all_excluded}
+        if not alive_miners:
+            # Fallback: only apply explicit exclusions
+            alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in exclude_uids}
         if not alive_miners:
             return None
         # Same weighted logic as select_miner but without session affinity
@@ -719,9 +776,9 @@ class IntelligentRouter:
         miner_list = list(alive_miners.values())
         for m in miner_list:
             load_factor = 1.0 / (1.0 + m.active_requests)
-            speed_factor = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+            speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
-            weights.append(max(w, 0.01))
+            weights.append(max(w, 0.001))
         total_w = sum(weights)
         if total_w == 0:
             return miner_list[0]
@@ -1876,6 +1933,9 @@ class HardenedGatewayValidator:
             challenge_passed=challenge_passed,
         )
         self.scoring.record_request(score)
+
+        # Update router blocked UIDs after each scored request
+        self.router.update_blocked_uids(self.scoring)
 
         # Track metrics
         self._quality_scores.append(quality)
@@ -3225,6 +3285,9 @@ async def _stream_response(
             )
             validator.scoring.record_request(score)
 
+            # Update router blocked UIDs after each scored request
+            validator.router.update_blocked_uids(validator.scoring)
+
             # Publish audit record (parity with non-streaming path)
             audit = AuditRecord(
                 request_id=request_id,
@@ -3381,6 +3444,38 @@ async def run_gateway(args):
         metagraph_discovery=discovery,
     )
 
+    # Set up auditor polling for external challenge data (split architecture)
+    auditor_url = getattr(args, 'auditor_url', None)
+
+    async def auditor_poll_loop():
+        """Periodically fetch challenge data from external audit_validator."""
+        if not auditor_url:
+            return
+        import aiohttp
+        log.info(f"[AUDITOR-POLL] Polling {auditor_url}/v1/scoreboard for challenge data")
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{auditor_url}/v1/scoreboard", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            blocked = set()
+                            for m in data.get("miners", []):
+                                uid = m["uid"]
+                                net_points = m.get("net_points", 0)
+                                pass_rate = m.get("pass_rate", 1.0)
+                                requests = m.get("requests", 0)
+                                # Block miners with negative net_points and enough samples
+                                if requests >= 3 and net_points < 0:
+                                    blocked.add(uid)
+                                # Block miners with low pass_rate and enough challenges
+                                elif requests >= 4 and pass_rate < 0.7:
+                                    blocked.add(uid)
+                            validator.router.update_auditor_blocked(blocked)
+            except Exception as e:
+                log.debug(f"[AUDITOR-POLL] Error: {e}")
+            await asyncio.sleep(30)
+
     app = create_gateway_app(validator)
 
     uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning")
@@ -3416,8 +3511,9 @@ async def run_gateway(args):
         cross_task = asyncio.create_task(validator.cross_probe_loop())
         health_task = asyncio.create_task(validator.health_recovery_loop())
         discovery_task = asyncio.create_task(validator.discovery_loop())
+        auditor_task = asyncio.create_task(auditor_poll_loop())
 
-        tasks = [synth_task, epoch_task, cache_task, cross_task, health_task, discovery_task]
+        tasks = [synth_task, epoch_task, cache_task, cross_task, health_task, discovery_task, auditor_task]
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -3810,6 +3906,7 @@ def main():
     parser.add_argument("--netuid", type=int, default=1, help="Subnet UID")
     parser.add_argument("--network", default="finney", help="Bittensor network (finney/test/local/ws://...)")
     parser.add_argument("--wallet-path", default=None, help="Wallet directory path")
+    parser.add_argument("--auditor-url", default=None, help="External audit_validator URL to fetch challenge data for routing")
     args = parser.parse_args()
 
     if not args.miners and not args.discover:

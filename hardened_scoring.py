@@ -823,6 +823,8 @@ class HardenedScoringEngine:
                 "synthetic": len(stats.synthetic_scores),
                 "divergence": stats.divergence,
                 "consistency": stats.consistency_score,
+                "passed_challenges": stats.passed_challenges,
+                "failed_challenges": stats.failed_challenges,
                 "pass_rate": stats.pass_rate,
                 "is_suspect": stats.is_suspect,
                 "avg_ttft_ms": stats.avg_ttft_ms,
