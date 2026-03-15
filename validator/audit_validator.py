@@ -1168,7 +1168,23 @@ class AuditValidator:
                 "latency_ms": CHALLENGE_TIMEOUT_HARD_MS + 5000,
                 "cosine_sim": 0.0,
             }
+        except (aiohttp.ClientConnectorError, ConnectionError, OSError) as e:
+            # Connection errors (miner unreachable/crashed) are NOT cheating — void them.
+            # Only genuine challenge failures (bad cosine, wrong hidden state) should
+            # be penalized. Penalizing connectivity issues causes unfair weight loss
+            # during brief outages (e.g. miner restart) and slow recovery.
+            log.info(
+                f"[AUDIT] Miner {miner_uid}: VOID (connection error) | "
+                f"reason={e}"
+            )
+            challenge_result = {
+                "passed": None,  # Void — not counted as pass or fail
+                "reason": f"connection_error: {e}",
+                "latency_ms": 0.0,
+                "cosine_sim": 0.0,
+            }
         except Exception as e:
+            # Unknown errors still fail — could be protocol-level cheating
             challenge_result = {
                 "passed": False,
                 "reason": str(e),
@@ -1184,10 +1200,15 @@ class AuditValidator:
         # Track successful deferred challenge in diagnostic counter (no penalty impact)
         self._deferred_challenge_counts[miner_uid] += 1
 
+        # Connection-error voids: skip scoring entirely — miner was unreachable,
+        # not cheating. No penalty, no audit count, no challenge rate update.
+        challenge_passed = challenge_result["passed"]
+        if challenge_passed is None:
+            return challenge_result
+
         # Record score — with RTT-corrected timing defense
         ttft_ms = record.get("ttft_ms", 0)
         tps = record.get("tokens_per_sec", 0)
-        challenge_passed = challenge_result["passed"]
         cos_sim = challenge_result["cosine_sim"]
         raw_latency = challenge_result["latency_ms"]
 
@@ -2122,17 +2143,20 @@ class AuditValidator:
                 uid = record.get("miner_uid")
                 miner_tps = record.get("tokens_per_sec", 50)
                 if miner_tps > 100:
-                    # Fast miner: delay [3, 15]s (mean ~5s)
+                    # Fast miner: delay [1, 8]s (mean ~2s)
+                    # High-TPS miners cycle LRU cache slots in < 1s at 200 TPS.
+                    # 87% eviction rate at [3,15]s was too long; reduced to
+                    # improve deferred challenge coverage to ~40-50%.
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(15, max(3, -5.0 * math.log(_u)))
+                    target_delay = min(8, max(1, -2.0 * math.log(_u)))
                 elif miner_tps > 50:
-                    # Medium miner: delay [5, 30]s (mean ~10s)
+                    # Medium miner: delay [3, 20]s (mean ~6s)
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(30, max(5, -10.0 * math.log(_u)))
+                    target_delay = min(20, max(3, -6.0 * math.log(_u)))
                 else:
-                    # Slow miner: delay [10, 60]s (mean ~20s)
+                    # Slow miner: delay [5, 40]s (mean ~12s)
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(60, max(10, -20.0 * math.log(_u)))
+                    target_delay = min(40, max(5, -12.0 * math.log(_u)))
                 elapsed = time.time() - queued_at
                 remaining = max(0, target_delay - elapsed)
                 if remaining > 0:
@@ -2289,7 +2313,7 @@ async def run_validator(args):
     # Optional status API
     import uvicorn
     app = create_validator_app(validator)
-    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.status_port, log_level="warning")
+    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.status_port, log_level="warning", log_config=None)
     server = uvicorn.Server(uvi_config)
 
     async def server_task():

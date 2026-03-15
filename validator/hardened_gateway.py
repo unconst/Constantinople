@@ -70,11 +70,15 @@ from collusion_detector import (
 
 log = logging.getLogger("hardened_gateway")
 log.setLevel(logging.INFO)
-if not log.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(_handler)
+# Force exactly one handler to sys.stdout — clear any duplicates
+log.handlers.clear()
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_handler)
 log.propagate = False
+# Prevent root logger from adding a second output path
+logging.root.handlers.clear()
+logging.root.addHandler(logging.NullHandler())
 
 # Version tracking for watchtower/deployment debugging
 GATEWAY_VERSION = "0.3.0"
@@ -195,7 +199,16 @@ try:
         wait_for_finalization=True,
         period=None,
     )
-    print(f"OK:{{response}}")
+    # response is (bool, message) — check success flag
+    if isinstance(response, (tuple, list)):
+        success, msg = response[0], response[1] if len(response) > 1 else ""
+        if success:
+            print(f"OK:{{response}}")
+        else:
+            print(f"ERR:set_weights returned False: {{msg}}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"OK:{{response}}")
 except Exception as e:
     print(f"ERR:{{e}}", file=sys.stderr)
     sys.exit(1)
@@ -680,20 +693,20 @@ class IntelligentRouter:
         self._blocked_uids = merged
 
     def _compute_speed_factor(self, m: MinerInfo) -> float:
-        """Combined speed factor: 40% TTFT + 60% TPS (matches validator scoring)."""
+        """Combined speed factor: 50% TTFT + 50% TPS for balanced routing."""
         # TTFT score: lower is better, normalize to [0, 1]
-        TTFT_EXCELLENT_MS = 200.0
-        TTFT_POOR_MS = 2000.0
+        TTFT_EXCELLENT_MS = 100.0   # Best observed (2×RTX 5090)
+        TTFT_POOR_MS = 1000.0       # Unacceptable for user experience
         if m.avg_ttft_ms > 0:
             ttft_score = max(0.05, min(1.0, 1.0 - (m.avg_ttft_ms - TTFT_EXCELLENT_MS) /
                                                      (TTFT_POOR_MS - TTFT_EXCELLENT_MS)))
         else:
             ttft_score = 0.5  # Unknown TTFT — neutral
 
-        # TPS score: higher is better
-        tps_score = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+        # TPS score: higher is better, cap at 200 to differentiate fast miners
+        tps_score = max(0.1, min(1.0, m.avg_tps / 200.0)) if m.avg_tps > 0 else 0.5
 
-        return 0.4 * ttft_score + 0.6 * tps_score
+        return 0.5 * ttft_score + 0.5 * tps_score
 
     def select_miner(self, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select the best miner for a request."""
@@ -2290,35 +2303,41 @@ class HardenedGatewayValidator:
         if self.scoring.should_end_epoch():
             summary = self.scoring.end_epoch()
 
-            # Analyze collusion pairs once — reuse for summary and penalties (avoids 3× O(n^2))
-            collusion_scores = self.collusion_detector.analyze_all_pairs()
+            # Collusion/cache analysis is best-effort — failures must not block weight-setting
+            try:
+                collusion_scores = self.collusion_detector.analyze_all_pairs()
+                summary["kv_cache"] = self.cache_prober.summary()
+                summary["collusion"] = self.collusion_detector.summary(cached_scores=collusion_scores)
 
-            # Attach cache and collusion data to epoch summary
-            summary["kv_cache"] = self.cache_prober.summary()
-            summary["collusion"] = self.collusion_detector.summary(cached_scores=collusion_scores)
-
-            # Apply cache and collusion weight adjustments
-            cache_adj = self.cache_prober.get_cache_weight_adjustments()
-            collusion_penalties = self.collusion_detector.get_weight_penalties(cached_scores=collusion_scores)
-            if summary["weights"]:
-                adjusted = {}
-                for uid, w in summary["weights"].items():
-                    adj = cache_adj.get(uid, 1.0)
-                    col = collusion_penalties.get(uid, 1.0)
-                    adjusted[uid] = w * adj * col
-                # Re-normalize
-                total = sum(adjusted.values())
-                if total > 0:
-                    summary["weights"] = {uid: w / total for uid, w in adjusted.items()}
+                cache_adj = self.cache_prober.get_cache_weight_adjustments()
+                collusion_penalties = self.collusion_detector.get_weight_penalties(cached_scores=collusion_scores)
+                if summary["weights"]:
+                    adjusted = {}
+                    for uid, w in summary["weights"].items():
+                        adj = cache_adj.get(uid, 1.0)
+                        col = collusion_penalties.get(uid, 1.0)
+                        adjusted[uid] = w * adj * col
+                    total = sum(adjusted.values())
+                    if total > 0:
+                        summary["weights"] = {uid: w / total for uid, w in adjusted.items()}
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] Collusion/cache analysis failed (weights unaffected): {e}")
 
             # Reset prober and detector for next epoch
-            self.cache_prober.reset()
-            self.collusion_detector.reset()
+            try:
+                self.cache_prober.reset()
+                self.collusion_detector.reset()
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] Prober/detector reset failed: {e}")
 
             self.epoch_summaries.append(summary)
             if len(self.epoch_summaries) > 100:
                 self.epoch_summaries = self.epoch_summaries[-100:]
-            self.r2.publish_epoch_summary(summary)
+
+            try:
+                self.r2.publish_epoch_summary(summary)
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] R2 publish failed: {e}")
 
             log.info(f"\n{'='*60}")
             log.info(f"EPOCH {summary['epoch']} COMPLETE")
@@ -2331,20 +2350,24 @@ class HardenedGatewayValidator:
                     f"pass_rate={info['pass_rate']:.1%} "
                     f"div={info['divergence']:.3f}{suspect}"
                 )
-            cache_info = summary["kv_cache"]
-            log.info(f"  KV Cache: {cache_info['total_probes']} probes, {cache_info['total_cache_hits']} hits")
-            collusion_info = summary["collusion"]
-            log.info(f"  Collusion: {collusion_info['total_pairs_analyzed']} pairs, {collusion_info['flagged_pairs']} flagged")
+            cache_info = summary.get("kv_cache", {})
+            log.info(f"  KV Cache: {cache_info.get('total_probes', 0)} probes, {cache_info.get('total_cache_hits', 0)} hits")
+            collusion_info = summary.get("collusion", {})
+            log.info(f"  Collusion: {collusion_info.get('total_pairs_analyzed', 0)} pairs, {collusion_info.get('flagged_pairs', 0)} flagged")
             log.info(f"{'='*60}\n")
 
-            # Set weights on chain if configured
+            # Set weights on chain — this is the critical path, must always execute
             if self.chain and summary["weights"]:
-                success = await self.chain.set_weights(summary["weights"])
-                summary["weights_committed"] = success
-                if success:
-                    log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
-                else:
-                    log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
+                try:
+                    success = await self.chain.set_weights(summary["weights"])
+                    summary["weights_committed"] = success
+                    if success:
+                        log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
+                    else:
+                        log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
+                except Exception as e:
+                    log.error(f"[EPOCH {summary['epoch']}] Weight-setting exception: {e}")
+                    summary["weights_committed"] = False
 
             return summary
         return None
@@ -3498,7 +3521,12 @@ async def run_gateway(args):
     auditor_url = getattr(args, 'auditor_url', None)
 
     async def auditor_poll_loop():
-        """Periodically fetch challenge data from external audit_validator."""
+        """Periodically fetch challenge data from external audit_validator.
+
+        In split architecture, the gateway defers all challenges to the auditor.
+        This loop syncs challenge pass/fail counts back into the gateway's scorer
+        so weight computation doesn't penalize miners for 'zero challenges'.
+        """
         if not auditor_url:
             return
         import aiohttp
@@ -3521,6 +3549,26 @@ async def run_gateway(args):
                                 # Block miners with very low pass_rate AND negative score
                                 elif requests >= 8 and pass_rate < 0.3 and net_points <= 0:
                                     blocked.add(uid)
+
+                                # Sync challenge counts from auditor into gateway scorer.
+                                # The gateway's own scorer sees challenge_passed=None for
+                                # all deferred requests, so without this sync, every miner
+                                # hits the "zero challenges" 0.05x weight penalty.
+                                # FIX: Use max() instead of overwrite. The auditor's epoch
+                                # may reset mid-gateway-epoch, dropping counts to 0.
+                                # We keep the highest counts seen during this gateway epoch.
+                                auditor_passed = m.get("passed_challenges", 0)
+                                auditor_failed = m.get("failed_challenges", 0)
+                                if auditor_passed + auditor_failed > 0:
+                                    stats = validator.scoring._get_stats(uid)
+                                    stats.passed_challenges = max(stats.passed_challenges, auditor_passed)
+                                    stats.failed_challenges = max(stats.failed_challenges, auditor_failed)
+                                # Sync cosine data from auditor for TPS bonus damping
+                                auditor_cosine = m.get("avg_cosine", 0.0)
+                                if auditor_cosine > 0 and (auditor_passed + auditor_failed > 0):
+                                    stats = validator.scoring._get_stats(uid)
+                                    if not stats.cosine_values or auditor_cosine > stats.avg_cosine:
+                                        stats.cosine_values = [auditor_cosine]
                             validator.router.update_auditor_blocked(blocked)
             except Exception as e:
                 log.debug(f"[AUDITOR-POLL] Error: {e}")
@@ -3572,7 +3620,7 @@ async def run_gateway(args):
 
     app = create_gateway_app(validator)
 
-    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning", log_config=None)
     server = uvicorn.Server(uvi_config)
 
     async def server_task():
@@ -3580,6 +3628,9 @@ async def run_gateway(args):
 
     async def main_loop():
         await asyncio.sleep(1)
+        # Clear root logger handlers that uvicorn.Server.serve() may have added
+        # despite log_config=None (uvicorn's startup still calls logging.config)
+        logging.root.handlers.clear()
         log.info(f"Hardened Gateway v{GATEWAY_VERSION} running on port {args.port}")
         log.info(f"Miners: {args.miners}")
         log.info(f"Epoch: {args.epoch_length}s | Synthetic interval: ~{args.synthetic_interval}s (with jitter)")
@@ -3590,9 +3641,8 @@ async def run_gateway(args):
         if config.MONITORING_KEYS:
             log.info(f"Monitoring auth: {len(config.MONITORING_KEYS)} keys configured")
         else:
-            log.warning(
-                "SECURITY: Monitoring endpoints (/v1/scoreboard, /v1/epochs, /metrics) "
-                "are OPEN. Miners can read scoring data. Set --monitoring-keys in production."
+            log.info(
+                "Monitoring auth: locked (no --monitoring-keys set, endpoints return 401)"
             )
         if chain:
             log.info(f"Chain: wallet={args.wallet} netuid={args.netuid} network={args.network}")

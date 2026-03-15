@@ -26,6 +26,12 @@ from dataclasses import dataclass, field
 import numpy as np
 
 log = logging.getLogger("hardened_scoring")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_handler)
+log.propagate = False
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -514,6 +520,10 @@ class HardenedScoringEngine:
         # Cache miss rates (set by auditor) — uid → (misses, total_attempts)
         self._cache_miss_rates: dict[int, tuple[int, int]] = {}
 
+        # Log-spam guards: only warn about divergence once per miner per epoch
+        self._divergence_warned: set[int] = set()
+        self._cross_div_warned: set[int] = set()
+
     def set_cache_miss_rate(self, uid: int, misses: int, total: int):
         """Called by auditor to report cache miss rates for weight penalty."""
         self._cache_miss_rates[uid] = (misses, total)
@@ -838,45 +848,55 @@ class HardenedScoringEngine:
                         )
 
             # Divergence penalty (per-epoch)
-            # Severe divergence (>25%) is penalized even at 100% pass rate to prevent
-            # verified miners from selectively throttling organic traffic while serving
-            # synthetics fast. Mild divergence at pass_rate=1.0 is tolerated (natural noise).
+            # Compares organic vs synthetic speed scores. Infrastructure noise causes
+            # high divergence for ALL miners (6-14x) regardless of honesty. Only penalize
+            # when pass_rate is significantly below 1.0 (multiple genuine failures),
+            # not from a single transient failure. At pass_rate>=0.90, divergence is
+            # much more likely infrastructure effects than selective throttling.
             pr = stats.pass_rate
             div = stats.divergence
-            if pr < 1.0:
+            if pr < 0.90:
                 if div > 0.25:
                     weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
-                    log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} → -70% weight")
+                    if uid not in self._divergence_warned:
+                        log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} → -70% weight")
+                        self._divergence_warned.add(uid)
                 elif div > DIVERGENCE_THRESHOLD:
                     weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
-                    log.warning(f"Miner {uid}: mild divergence={div:.3f} → -30% weight")
-            elif div > 0.25:
-                # Even at pass_rate=1.0, severe divergence gets a mild penalty
-                weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
-                log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} at pass_rate=100% → -30% weight")
+                    if uid not in self._divergence_warned:
+                        log.warning(f"Miner {uid}: mild divergence={div:.3f} → -30% weight")
+                        self._divergence_warned.add(uid)
             elif div > DIVERGENCE_THRESHOLD:
-                log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate=100% — monitoring only")
+                # pass_rate>=0.90: miner mostly passes challenges, divergence is likely
+                # infrastructure noise (Cloudflare proxy, concurrency, network hops).
+                # Only log once, no weight penalty.
+                if uid not in self._divergence_warned:
+                    log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate={pr:.0%} — monitoring only")
+                    self._divergence_warned.add(uid)
 
             # Cross-epoch divergence: catches miners staying under per-epoch sample minimums
-            # Same severe-divergence-at-100%-pass-rate policy as per-epoch check above.
+            # Same policy as per-epoch: only penalize at pr<0.90 (multiple genuine failures).
             cross = self._cross_epoch_scores.get(uid)
             if cross and len(cross["organic"]) >= MIN_ORGANIC_SAMPLES and len(cross["synthetic"]) >= MIN_SYNTHETIC_SAMPLES:
                 cross_org_mean = sum(cross["organic"]) / len(cross["organic"])
                 cross_syn_mean = sum(cross["synthetic"]) / len(cross["synthetic"])
                 if cross_syn_mean > 0:
                     cross_div = abs(cross_org_mean - cross_syn_mean) / max(cross_syn_mean, 0.001)
-                    if pr < 1.0:
+                    if pr < 0.90:
                         if cross_div > 0.25:
                             weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
-                            log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} → -70% weight")
+                            if uid not in self._cross_div_warned:
+                                log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} → -70% weight")
+                                self._cross_div_warned.add(uid)
                         elif cross_div > DIVERGENCE_THRESHOLD:
                             weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
-                            log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} → -30% weight")
-                    elif cross_div > 0.25:
-                        weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
-                        log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} at pass_rate=100% → -30% weight")
+                            if uid not in self._cross_div_warned:
+                                log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} → -30% weight")
+                                self._cross_div_warned.add(uid)
                     elif cross_div > DIVERGENCE_THRESHOLD:
-                        log.info(f"Miner {uid}: cross-epoch divergence={cross_div:.3f} but pass_rate=100% — monitoring only")
+                        if uid not in self._cross_div_warned:
+                            log.info(f"Miner {uid}: cross-epoch divergence={cross_div:.3f} but pass_rate={pr:.0%} — monitoring only")
+                            self._cross_div_warned.add(uid)
 
             # Suspect penalty (current epoch)
             if stats.is_suspect:
@@ -918,14 +938,11 @@ class HardenedScoringEngine:
             # Applies starting at 3 requests (not 10) to prevent short-lived Sybil
             # campaigns that serve <10 requests per UID to evade participation checks.
             total_challenged = stats.passed_challenges + stats.failed_challenges
-            if stats.total_requests >= 3:
+            # Only penalize zero-challenge at higher request counts to avoid false
+            # positives with adaptive (low) challenge rates. At 22% rate, P(0 challenges in
+            # 10 requests) = 0.78^10 ≈ 8%, still plausible. At 15 requests ≈ 2%.
+            if stats.total_requests >= 15:
                 if total_challenged == 0:
-                    # RED-TEAM FIX (step 14): Increased from 0.3x to 0.05x.
-                    # Zero challenges means the miner provided ZERO verification
-                    # evidence. At 0.3x, a fast miner with 100% cache miss could
-                    # still earn ~14% weight by accumulating unchallenged points.
-                    # At 0.05x, that drops to ~2% — still nonzero (gives new miners
-                    # a chance to prove themselves) but not exploitable.
                     weight *= 0.05
                     log.warning(f"Miner {uid}: zero challenges out of {stats.total_requests} requests → 0.05x weight")
                 else:
@@ -975,6 +992,15 @@ class HardenedScoringEngine:
                 if weight != 0.0:
                     log.warning(f"Miner {uid}: non-finite or subnormal weight {weight} → 0.0")
                 weight = 0.0
+            # Trace weight factors at debug level (info-level only at epoch end)
+            log.debug(
+                f"[WEIGHT_TRACE] Miner {uid}: net_pts={stats.net_points:.3f} "
+                f"consistency={stats.consistency_score:.3f} "
+                f"cosine_avg={stats.avg_cosine:.3f} "
+                f"passed={stats.passed_challenges} failed={stats.failed_challenges} "
+                f"pr={stats.pass_rate:.3f} "
+                f"raw_weight={weight:.6f}"
+            )
             raw_weights[uid] = weight
 
         # Availability bonus: second pass using fleet-relative request counts.
@@ -1028,6 +1054,8 @@ class HardenedScoringEngine:
         self._population_ttft = deque(maxlen=self._MAX_POPULATION_SAMPLES)
         self._population_tps = deque(maxlen=self._MAX_POPULATION_SAMPLES)
         self._cache_miss_rates = {}  # Fresh per-epoch cache miss evaluation
+        self._divergence_warned = set()   # Reset log-spam guards
+        self._cross_div_warned = set()
 
         # Update suspect history BEFORE computing weights so that first-time
         # suspects get the history penalty in the same epoch they're flagged.
@@ -1122,9 +1150,12 @@ class HardenedScoringEngine:
                 "divergence": stats.divergence,
                 "consistency": stats.consistency_score,
                 "pass_rate": stats.pass_rate,
+                "passed_challenges": stats.passed_challenges,
+                "failed_challenges": stats.failed_challenges,
                 "is_suspect": stats.is_suspect,
                 "avg_ttft_ms": stats.avg_ttft_ms,
                 "avg_tps": stats.avg_tps,
+                "avg_cosine": stats.avg_cosine,
                 "computed_weight": live_weights.get(uid, 0.0),
             })
         return sorted(board, key=lambda x: x["computed_weight"], reverse=True)

@@ -28,6 +28,7 @@ from typing import Optional
 import numpy as np
 
 log = logging.getLogger("challenge_engine")
+log.propagate = False
 
 
 @dataclass
