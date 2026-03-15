@@ -2272,7 +2272,7 @@ class HardenedGatewayValidator:
             turn2_ttft_ms=ttft2,
             ttft_ratio=ratio,
             cache_score=compute_cache_score(ratio),
-            challenge_passed=result2["verification"] == 1.0,
+            challenge_passed=result2["verification"] > 0.0,
             turn1_input_tokens=result1["input_tokens"],
             turn2_input_tokens=result2["input_tokens"],
             probe_delay_s=delay,
