@@ -693,20 +693,20 @@ class IntelligentRouter:
         self._blocked_uids = merged
 
     def _compute_speed_factor(self, m: MinerInfo) -> float:
-        """Combined speed factor: 40% TTFT + 60% TPS (matches validator scoring)."""
+        """Combined speed factor: 50% TTFT + 50% TPS for balanced routing."""
         # TTFT score: lower is better, normalize to [0, 1]
-        TTFT_EXCELLENT_MS = 200.0
-        TTFT_POOR_MS = 2000.0
+        TTFT_EXCELLENT_MS = 100.0   # Best observed (2×RTX 5090)
+        TTFT_POOR_MS = 1000.0       # Unacceptable for user experience
         if m.avg_ttft_ms > 0:
             ttft_score = max(0.05, min(1.0, 1.0 - (m.avg_ttft_ms - TTFT_EXCELLENT_MS) /
                                                      (TTFT_POOR_MS - TTFT_EXCELLENT_MS)))
         else:
             ttft_score = 0.5  # Unknown TTFT — neutral
 
-        # TPS score: higher is better
-        tps_score = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+        # TPS score: higher is better, cap at 200 to differentiate fast miners
+        tps_score = max(0.1, min(1.0, m.avg_tps / 200.0)) if m.avg_tps > 0 else 0.5
 
-        return 0.4 * ttft_score + 0.6 * tps_score
+        return 0.5 * ttft_score + 0.5 * tps_score
 
     def select_miner(self, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select the best miner for a request."""
