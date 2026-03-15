@@ -714,10 +714,12 @@ class IntelligentRouter:
                     return miner
 
         # Weighted selection based on reliability, load, and speed (TTFT + TPS)
+        # Load factor uses exponential decay so heavily loaded miners are deprioritized
+        # faster — this directly improves TTFT for end users.
         weights = []
         miner_list = list(alive_miners.values())
         for m in miner_list:
-            load_factor = 1.0 / (1.0 + m.active_requests)
+            load_factor = 0.5 ** m.active_requests  # 1.0, 0.5, 0.25, 0.125, ...
             speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
             # Only add positive weights — no minimum floor for cheaters

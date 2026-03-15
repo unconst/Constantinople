@@ -486,6 +486,14 @@ class AuditValidator:
         # Known miners (populated by discovery)
         self.miners: dict[int, MinerEndpoint] = {}
 
+        # Track consecutive connection failures per miner to skip dead ones in synthetic loop
+        self._synth_consec_fails: dict[int, int] = defaultdict(int)
+        _SYNTH_FAIL_THRESHOLD = 3  # Skip after 3 consecutive failures
+        _SYNTH_FAIL_RETRY_INTERVAL = 300  # Re-try dead miners every 5 minutes
+        self._synth_fail_threshold = _SYNTH_FAIL_THRESHOLD
+        self._synth_fail_retry = _SYNTH_FAIL_RETRY_INTERVAL
+        self._synth_last_retry: dict[int, float] = defaultdict(float)
+
         # Stats
         self.total_audits = 0
         self.total_passed = 0
@@ -1607,10 +1615,20 @@ class AuditValidator:
                     await asyncio.sleep(10)
                     continue
 
-                # Pick a random miner
-                miner_uids = list(self.miners.keys())
+                # Pick a random miner, skipping dead ones (retry every 5 min)
+                now_synth = time.time()
+                miner_uids = [
+                    u for u in self.miners
+                    if self._synth_consec_fails[u] < self._synth_fail_threshold
+                    or (now_synth - self._synth_last_retry[u]) > self._synth_fail_retry
+                ]
+                if not miner_uids:
+                    miner_uids = list(self.miners.keys())
                 uid = secrets.choice(miner_uids)
                 miner = self.miners[uid]
+                # Mark retry timestamp for dead-miner retries
+                if self._synth_consec_fails[uid] >= self._synth_fail_threshold:
+                    self._synth_last_retry[uid] = now_synth
 
                 # Generate prompt with randomized structure to prevent fingerprinting
                 topic = secrets.choice(_TOPICS)
@@ -1718,9 +1736,18 @@ class AuditValidator:
                             result = json.loads(await resp.read())
                     wall_time_ms = (time.perf_counter() - wall_start) * 1000.0
                 except Exception as e:
-                    log.info(f"[SYNTH] Miner {uid} error: {e}")
-                    await asyncio.sleep(10)
+                    self._synth_consec_fails[uid] += 1
+                    if self._synth_consec_fails[uid] == self._synth_fail_threshold:
+                        log.info(f"[SYNTH] Miner {uid}: {self._synth_fail_threshold} consecutive failures, skipping until retry")
+                    elif self._synth_consec_fails[uid] < self._synth_fail_threshold:
+                        log.info(f"[SYNTH] Miner {uid} error: {e}")
+                    await asyncio.sleep(2)
                     continue
+
+                # Success — reset failure counter
+                if self._synth_consec_fails[uid] > 0:
+                    log.info(f"[SYNTH] Miner {uid}: recovered after {self._synth_consec_fails[uid]} failures")
+                    self._synth_consec_fails[uid] = 0
 
                 response_text = result.get("text", "")
                 reported_ttft = result.get("ttft_ms", 0)
@@ -1872,10 +1899,19 @@ class AuditValidator:
                     await asyncio.sleep(30)
                     continue
 
-                # Pick a random miner
-                miner_uids = list(self.miners.keys())
+                # Pick a random miner, skipping dead ones
+                now_bw = time.time()
+                miner_uids = [
+                    u for u in self.miners
+                    if self._synth_consec_fails[u] < self._synth_fail_threshold
+                    or (now_bw - self._synth_last_retry[u]) > self._synth_fail_retry
+                ]
+                if not miner_uids:
+                    miner_uids = list(self.miners.keys())
                 uid = secrets.choice(miner_uids)
                 miner = self.miners[uid]
+                if self._synth_consec_fails[uid] >= self._synth_fail_threshold:
+                    self._synth_last_retry[uid] = now_bw
 
                 # Re-randomize per cycle to prevent parameter fingerprinting
                 CONCURRENCY = 2 + secrets.randbelow(4)  # 2-5 simultaneous requests
@@ -1991,9 +2027,16 @@ class AuditValidator:
 
                 successful = [r for r in results if r is not None]
                 if not successful:
-                    log.info(f"[BANDWIDTH] Miner {uid}: all {CONCURRENCY} probes failed")
-                    await asyncio.sleep(120)  # retry after 2 min on total failure
+                    self._synth_consec_fails[uid] += 1
+                    if self._synth_consec_fails[uid] == self._synth_fail_threshold:
+                        log.info(f"[BANDWIDTH] Miner {uid}: {self._synth_fail_threshold} consecutive failures, skipping")
+                    else:
+                        log.info(f"[BANDWIDTH] Miner {uid}: all {CONCURRENCY} probes failed")
+                    await asyncio.sleep(30)
                     continue
+                # Reset failure counter on any success
+                if self._synth_consec_fails[uid] > 0:
+                    self._synth_consec_fails[uid] = 0
 
                 # Compute aggregate metrics
                 total_tokens = sum(r["output_tokens"] for r in successful)

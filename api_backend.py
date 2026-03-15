@@ -1877,6 +1877,44 @@ async def dataset_epochs():
     except Exception as e:
         raise HTTPException(500, f"Dataset read error: {e}")
 
+@app.get("/v1/dataset/download")
+async def dataset_download(date: str = None):
+    """Bulk download audit records as streaming JSONL. Public, no auth needed.
+    Use ?date=2026-03-14 for a specific date. Defaults to today.
+    Example: curl https://api.constantinople.cloud/v1/dataset/download > records.jsonl"""
+    from starlette.responses import StreamingResponse
+    s3 = _get_r2_client()
+    if not s3:
+        raise HTTPException(503, "Dataset storage not configured")
+    bucket = os.environ.get("R2_BUCKET", "affine")
+    if date:
+        prefix = f"audit/{date.replace('-','/')[:10]}/"
+    else:
+        from datetime import datetime as dt
+        now = dt.utcnow()
+        prefix = f"audit/{now.strftime('%Y/%m/%d')}/"
+        date = now.strftime('%Y-%m-%d')
+
+    async def stream_records():
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                try:
+                    data = s3.get_object(Bucket=bucket, Key=obj["Key"])
+                    record = json.loads(data["Body"].read())
+                    record.pop("commitments", None)
+                    record.pop("all_token_ids", None)
+                    yield json.dumps(record) + "\n"
+                except Exception:
+                    continue
+
+    return StreamingResponse(
+        stream_records(),
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": f"attachment; filename=constantinople-{date}.jsonl"},
+    )
+
+
 @app.get("/v1/dataset/stats")
 async def dataset_stats():
     """Get dataset summary stats. Public, no auth needed."""
@@ -1896,8 +1934,10 @@ async def dataset_stats():
             "total_epochs": n_epochs,
             "access": {
                 "recent": "/v1/dataset/recent?limit=50&date=2026-03-14",
+                "download": "/v1/dataset/download?date=2026-03-14",
                 "epochs": "/v1/dataset/epochs",
-                "curl": "curl https://api.constantinople.cloud/v1/dataset/recent?limit=10",
+                "curl_recent": "curl https://api.constantinople.cloud/v1/dataset/recent?limit=10",
+                "curl_download": "curl -o records.jsonl https://api.constantinople.cloud/v1/dataset/download",
             },
         }
     except Exception as e:
