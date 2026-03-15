@@ -2289,7 +2289,7 @@ async def run_validator(args):
     # Optional status API
     import uvicorn
     app = create_validator_app(validator)
-    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.status_port, log_level="warning")
+    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.status_port, log_level="warning", log_config=None)
     server = uvicorn.Server(uvi_config)
 
     async def server_task():

@@ -3588,7 +3588,7 @@ async def run_gateway(args):
 
     app = create_gateway_app(validator)
 
-    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning", log_config=None)
     server = uvicorn.Server(uvi_config)
 
     async def server_task():
