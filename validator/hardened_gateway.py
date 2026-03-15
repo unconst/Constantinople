@@ -1097,24 +1097,50 @@ class HardenedGatewayValidator:
             aspect = secrets.choice(self._ASPECTS)
             return template.format(topic=topic, topicA=topicA, topicB=topicB, aspect=aspect)
 
-    def _generate_dummy_challenge_fields(self, max_tokens: int) -> dict:
+    def _generate_dummy_challenge_fields(self, max_tokens: int, prompt: str = None, messages: list = None) -> dict:
         """
         Generate plausible-looking dummy challenge fields for non-challenged requests.
         These are indistinguishable from real challenge params — miners ALWAYS receive
         challenge_layer/challenge_token so they cannot fingerprint by field presence.
+
+        Uses the SAME distribution as real challenges:
+        - Same estimated_seq_len formula (prompt_tokens + max_tokens ± 10% noise)
+        - Same layer exclusion (skip last 2 layers)
+        - Same multi-point probability and count (20% chance, exactly 3 extra points)
         """
         num_layers = self.model.config.num_layers
-        # Estimated seq_len mirrors the real challenge computation
-        estimated_seq_len = max(10, max_tokens + 50)  # Rough estimate
-        dummy_layer = secrets.randbelow(num_layers)
+        # Exclude last 2 layers — same as real challenges in challenge_engine
+        safe_layers = max(num_layers - 2, 1)
+
+        # Compute estimated_seq_len using the same formula as real challenges
+        if prompt or messages:
+            if hasattr(self.model, 'tokenizer'):
+                if messages and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                    est_prompt = self.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    est_prompt = prompt or ""
+                prompt_token_count = len(self.model.tokenizer.encode(est_prompt))
+            else:
+                prompt_token_count = max_tokens  # fallback
+        else:
+            prompt_token_count = max_tokens  # fallback
+
+        estimated_seq_len = prompt_token_count + max_tokens
+        # Add ±10% noise — same as real challenges
+        noise_range = max(1, estimated_seq_len // 10)
+        estimated_seq_len += secrets.randbelow(2 * noise_range + 1) - noise_range
+        estimated_seq_len = max(2, estimated_seq_len)
+
+        dummy_layer = secrets.randbelow(safe_layers)
         dummy_token = secrets.randbelow(max(estimated_seq_len, 1))
         result = {"challenge_layer": dummy_layer, "challenge_token": dummy_token}
-        # 20% chance of dummy extra points (matches multi_point_probability)
+        # 20% chance of multi-point — exactly 3 extra points (matches challenge_engine)
         if secrets.randbelow(5) == 0:
-            n_extra = secrets.randbelow(3) + 2  # 2-4 extra points
             result["challenge_extra"] = [
-                [secrets.randbelow(num_layers), secrets.randbelow(max(estimated_seq_len, 1))]
-                for _ in range(n_extra)
+                [secrets.randbelow(safe_layers), secrets.randbelow(max(estimated_seq_len, 1))]
+                for _ in range(3)
             ]
         return result
 
@@ -1153,7 +1179,7 @@ class HardenedGatewayValidator:
             if challenge_params.get("extra_points"):
                 payload["challenge_extra"] = challenge_params["extra_points"]
         else:
-            dummy = self._generate_dummy_challenge_fields(max_tokens)
+            dummy = self._generate_dummy_challenge_fields(max_tokens, prompt=prompt, messages=messages)
             payload["challenge_layer"] = dummy["challenge_layer"]
             payload["challenge_token"] = dummy["challenge_token"]
             if "challenge_extra" in dummy:
@@ -3115,7 +3141,7 @@ async def _stream_response(
         if challenge_params.get("extra_points"):
             payload["challenge_extra"] = challenge_params["extra_points"]
     else:
-        dummy = validator._generate_dummy_challenge_fields(max_tokens)
+        dummy = validator._generate_dummy_challenge_fields(max_tokens, prompt=prompt, messages=messages)
         payload["challenge_layer"] = dummy["challenge_layer"]
         payload["challenge_token"] = dummy["challenge_token"]
         if "challenge_extra" in dummy:

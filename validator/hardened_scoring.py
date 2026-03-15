@@ -849,49 +849,55 @@ class HardenedScoringEngine:
 
             # Divergence penalty (per-epoch)
             # Compares organic vs synthetic speed scores. Infrastructure noise causes
-            # high divergence for ALL miners (6-14x) regardless of honesty. Only penalize
-            # when pass_rate is significantly below 1.0 (multiple genuine failures),
-            # not from a single transient failure. At pass_rate>=0.90, divergence is
-            # much more likely infrastructure effects than selective throttling.
+            # high divergence for ALL miners (6-14x) regardless of honesty. Use a
+            # graduated penalty that scales with failure rate rather than a hard cliff.
+            # At pass_rate>=0.97, no penalty (noise). At pass_rate<0.80, full penalty.
+            # Between 0.80-0.97, linearly interpolated penalty fraction.
             pr = stats.pass_rate
             div = stats.divergence
-            if pr < 0.90:
+            # Graduated: penalty_scale goes from 0 at pr>=0.97 to 1.0 at pr<=0.80
+            div_penalty_scale = max(0.0, min(1.0, (0.97 - pr) / 0.17)) if div > DIVERGENCE_THRESHOLD else 0.0
+            if div_penalty_scale > 0:
                 if div > 0.25:
-                    weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
+                    actual_penalty = DIVERGENCE_PENALTY_SEVERE * div_penalty_scale
+                    weight *= (1.0 - actual_penalty)
                     if uid not in self._divergence_warned:
-                        log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} → -70% weight")
+                        log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight (scale={div_penalty_scale:.2f})")
                         self._divergence_warned.add(uid)
                 elif div > DIVERGENCE_THRESHOLD:
-                    weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
+                    actual_penalty = DIVERGENCE_PENALTY_MILD * div_penalty_scale
+                    weight *= (1.0 - actual_penalty)
                     if uid not in self._divergence_warned:
-                        log.warning(f"Miner {uid}: mild divergence={div:.3f} → -30% weight")
+                        log.warning(f"Miner {uid}: mild divergence={div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight (scale={div_penalty_scale:.2f})")
                         self._divergence_warned.add(uid)
             elif div > DIVERGENCE_THRESHOLD:
-                # pass_rate>=0.90: miner mostly passes challenges, divergence is likely
-                # infrastructure noise (Cloudflare proxy, concurrency, network hops).
-                # Only log once, no weight penalty.
+                # pass_rate>=0.97: miner overwhelmingly passes challenges, divergence is
+                # infrastructure noise. Only log once, no weight penalty.
                 if uid not in self._divergence_warned:
                     log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate={pr:.0%} — monitoring only")
                     self._divergence_warned.add(uid)
 
             # Cross-epoch divergence: catches miners staying under per-epoch sample minimums
-            # Same policy as per-epoch: only penalize at pr<0.90 (multiple genuine failures).
+            # Same graduated policy as per-epoch divergence.
             cross = self._cross_epoch_scores.get(uid)
             if cross and len(cross["organic"]) >= MIN_ORGANIC_SAMPLES and len(cross["synthetic"]) >= MIN_SYNTHETIC_SAMPLES:
                 cross_org_mean = sum(cross["organic"]) / len(cross["organic"])
                 cross_syn_mean = sum(cross["synthetic"]) / len(cross["synthetic"])
                 if cross_syn_mean > 0:
                     cross_div = abs(cross_org_mean - cross_syn_mean) / max(cross_syn_mean, 0.001)
-                    if pr < 0.90:
+                    cross_div_scale = max(0.0, min(1.0, (0.97 - pr) / 0.17)) if cross_div > DIVERGENCE_THRESHOLD else 0.0
+                    if cross_div_scale > 0:
                         if cross_div > 0.25:
-                            weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
+                            actual_penalty = DIVERGENCE_PENALTY_SEVERE * cross_div_scale
+                            weight *= (1.0 - actual_penalty)
                             if uid not in self._cross_div_warned:
-                                log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} → -70% weight")
+                                log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight")
                                 self._cross_div_warned.add(uid)
                         elif cross_div > DIVERGENCE_THRESHOLD:
-                            weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
+                            actual_penalty = DIVERGENCE_PENALTY_MILD * cross_div_scale
+                            weight *= (1.0 - actual_penalty)
                             if uid not in self._cross_div_warned:
-                                log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} → -30% weight")
+                                log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight")
                                 self._cross_div_warned.add(uid)
                     elif cross_div > DIVERGENCE_THRESHOLD:
                         if uid not in self._cross_div_warned:
