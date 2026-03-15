@@ -3641,9 +3641,8 @@ async def run_gateway(args):
         if config.MONITORING_KEYS:
             log.info(f"Monitoring auth: {len(config.MONITORING_KEYS)} keys configured")
         else:
-            log.warning(
-                "SECURITY: Monitoring endpoints (/v1/scoreboard, /v1/epochs, /metrics) "
-                "are OPEN. Miners can read scoring data. Set --monitoring-keys in production."
+            log.info(
+                "Monitoring auth: locked (no --monitoring-keys set, endpoints return 401)"
             )
         if chain:
             log.info(f"Chain: wallet={args.wallet} netuid={args.netuid} network={args.network}")
