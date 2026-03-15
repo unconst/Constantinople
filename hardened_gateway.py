@@ -2410,6 +2410,7 @@ class HardenedGatewayValidator:
         """Background loop for metagraph-based miner discovery."""
         if not self.discovery:
             return
+        first_run = True
         while True:
             try:
                 miners = await self.discovery.discover_miners()
@@ -2423,6 +2424,25 @@ class HardenedGatewayValidator:
                         if hotkey:
                             self.scoring.register_hotkey(m["uid"], hotkey)
                     self.router.remove_stale_miners(active_uids)
+                    # On first discovery, health-check all miners so dead ones
+                    # don't get routed to before the normal health loop catches them
+                    if first_run:
+                        first_run = False
+                        session = await self._get_http_session()
+                        for uid, miner in list(self.router.miners.items()):
+                            if not miner.alive:
+                                continue
+                            try:
+                                async with session.get(
+                                    f"{miner.endpoint}/health",
+                                    timeout=aiohttp.ClientTimeout(total=5),
+                                ) as resp:
+                                    if resp.status != 200:
+                                        raise Exception(f"HTTP {resp.status}")
+                            except Exception:
+                                miner.alive = False
+                                miner.reliability_score = 0.0
+                                log.info(f"[DISCOVERY] Miner {uid} ({miner.endpoint}): unreachable on first sync, marked DEAD")
                 await asyncio.sleep(self.discovery.sync_interval)
             except asyncio.CancelledError:
                 break
@@ -3499,6 +3519,50 @@ async def run_gateway(args):
             except Exception as e:
                 log.debug(f"[AUDITOR-POLL] Error: {e}")
             await asyncio.sleep(30)
+
+    # ── Pre-flight: poll auditor + health-check miners BEFORE accepting traffic ──
+    if auditor_url:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{auditor_url}/v1/scoreboard",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        blocked = set()
+                        for m in data.get("miners", []):
+                            uid = m["uid"]
+                            net_pts = m.get("net_points", 0)
+                            pr = m.get("pass_rate", 1.0)
+                            reqs = m.get("requests", 0)
+                            if reqs >= 3 and net_pts < 0:
+                                blocked.add(uid)
+                            elif reqs >= 8 and pr < 0.3 and net_pts <= 0:
+                                blocked.add(uid)
+                        validator.router.update_auditor_blocked(blocked)
+                        log.info(f"[STARTUP] Pre-loaded auditor blocked UIDs: {blocked}")
+        except Exception as e:
+            log.warning(f"[STARTUP] Could not pre-load auditor data: {e}")
+
+    # Quick health-check all static miners — mark unreachable ones dead immediately
+    import aiohttp as _aiohttp
+    async def _startup_health_check():
+        async with _aiohttp.ClientSession() as session:
+            for uid, miner in list(validator.router.miners.items()):
+                try:
+                    async with session.get(
+                        f"{miner.endpoint}/health",
+                        timeout=_aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                except Exception:
+                    miner.alive = False
+                    miner.reliability_score = 0.0
+                    log.info(f"[STARTUP] Miner {uid} ({miner.endpoint}): unreachable, marked DEAD")
+    await _startup_health_check()
 
     app = create_gateway_app(validator)
 
