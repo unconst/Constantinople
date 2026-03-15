@@ -70,11 +70,15 @@ from collusion_detector import (
 
 log = logging.getLogger("hardened_gateway")
 log.setLevel(logging.INFO)
-if not log.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(_handler)
+# Force exactly one handler to sys.stdout — clear any duplicates
+log.handlers.clear()
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_handler)
 log.propagate = False
+# Prevent root logger from adding a second output path
+logging.root.handlers.clear()
+logging.root.addHandler(logging.NullHandler())
 
 # Version tracking for watchtower/deployment debugging
 GATEWAY_VERSION = "0.3.0"
@@ -3596,6 +3600,9 @@ async def run_gateway(args):
 
     async def main_loop():
         await asyncio.sleep(1)
+        # Clear root logger handlers that uvicorn.Server.serve() may have added
+        # despite log_config=None (uvicorn's startup still calls logging.config)
+        logging.root.handlers.clear()
         log.info(f"Hardened Gateway v{GATEWAY_VERSION} running on port {args.port}")
         log.info(f"Miners: {args.miners}")
         log.info(f"Epoch: {args.epoch_length}s | Synthetic interval: ~{args.synthetic_interval}s (with jitter)")
