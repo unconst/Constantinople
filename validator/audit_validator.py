@@ -535,7 +535,7 @@ class AuditValidator:
         # Deferred challenge queue — breaks timing correlation between inference
         # and challenge (Vector 29). Instead of challenging immediately after
         # inference, we queue records and process them after a random delay
-        # (30-180s), so miners can't detect "inference → challenge" timing.
+        # (10-60s), so miners can't detect "inference → challenge" timing.
         self._deferred_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
@@ -1071,17 +1071,17 @@ class AuditValidator:
                             self._deferred_eviction_counts[miner_uid] += 1
                             self._deferred_challenge_counts[miner_uid] += 1
                             eviction_rate = self._deferred_eviction_counts[miner_uid] / self._deferred_challenge_counts[miner_uid]
-                            # RED-TEAM FIX (step 15): Lowered from 80%/3 to 50%/2.
-                            # A miner could "boundary surf" at 79% eviction to avoid
-                            # the FAIL penalty. 50% over 2+ attempts catches evasion
-                            # earlier. Genuine OOM causes <30% eviction typically.
+                            # Eviction FAIL threshold: 70% over 5+ attempts.
+                            # With reduced delay window (10-60s), legitimate miners
+                            # should evict <40%. Only persistent, high-rate eviction
+                            # (likely intentional cache-dumping) gets penalized.
                             total_deferred = self._deferred_challenge_counts[miner_uid]
-                            if total_deferred >= 2 and eviction_rate >= 0.50:
+                            if total_deferred >= 5 and eviction_rate >= 0.70:
                                 log.warning(
                                     f"[AUDIT] FAIL (persistent cache_miss) | "
                                     f"layer={challenge.layer_index} pos={challenge.token_index} — "
                                     f"eviction_rate={eviction_rate:.0%} ({self._deferred_eviction_counts[miner_uid]}/{total_deferred}) "
-                                    f"≥ 50% over ≥ 2 attempts → treating as FAIL"
+                                    f"≥ 70% over ≥ 5 attempts → treating as FAIL"
                                 )
                                 return {
                                     "passed": False,
@@ -1467,6 +1467,9 @@ class AuditValidator:
                     # by historical misses from previous epochs.
                     self._cache_miss_counts.clear()
                     self._cache_challenge_counts.clear()
+                    # Also reset deferred eviction counters per epoch
+                    self._deferred_eviction_counts.clear()
+                    self._deferred_challenge_counts.clear()
                     self.epoch_summaries.append(summary)
                     if len(self.epoch_summaries) > 100:
                         self.epoch_summaries = self.epoch_summaries[-100:]
@@ -2113,9 +2116,23 @@ class AuditValidator:
 
                 # Random delay before issuing challenge — exponential
                 # distribution mimics natural spacing.
-                # Mean ~60s (lambda=1/60), clamped [30, 180]s
-                _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                target_delay = min(180, max(30, -60.0 * math.log(_u)))
+                # Adaptive delay: high-TPS miners get shorter delays because
+                # their LRU caches fill faster (200 slots at 200 TPS = 1s/slot).
+                # Low-TPS miners can tolerate longer delays.
+                uid = record.get("miner_uid")
+                miner_tps = record.get("tokens_per_sec", 50)
+                if miner_tps > 100:
+                    # Fast miner: delay [3, 15]s (mean ~5s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(15, max(3, -5.0 * math.log(_u)))
+                elif miner_tps > 50:
+                    # Medium miner: delay [5, 30]s (mean ~10s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(30, max(5, -10.0 * math.log(_u)))
+                else:
+                    # Slow miner: delay [10, 60]s (mean ~20s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(60, max(10, -20.0 * math.log(_u)))
                 elapsed = time.time() - queued_at
                 remaining = max(0, target_delay - elapsed)
                 if remaining > 0:

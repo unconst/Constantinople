@@ -2116,11 +2116,23 @@ class AuditValidator:
 
                 # Random delay before issuing challenge — exponential
                 # distribution mimics natural spacing.
-                # Mean ~20s (lambda=1/20), clamped [10, 60]s
-                # (Reduced from [30, 180]s to lower cache eviction rate —
-                #  59% evictions meant most deferred challenges were wasted)
-                _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                target_delay = min(60, max(10, -20.0 * math.log(_u)))
+                # Adaptive delay: high-TPS miners get shorter delays because
+                # their LRU caches fill faster (200 slots at 200 TPS = 1s/slot).
+                # Low-TPS miners can tolerate longer delays.
+                uid = record.get("miner_uid")
+                miner_tps = record.get("tokens_per_sec", 50)
+                if miner_tps > 100:
+                    # Fast miner: delay [3, 15]s (mean ~5s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(15, max(3, -5.0 * math.log(_u)))
+                elif miner_tps > 50:
+                    # Medium miner: delay [5, 30]s (mean ~10s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(30, max(5, -10.0 * math.log(_u)))
+                else:
+                    # Slow miner: delay [10, 60]s (mean ~20s)
+                    _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
+                    target_delay = min(60, max(10, -20.0 * math.log(_u)))
                 elapsed = time.time() - queued_at
                 remaining = max(0, target_delay - elapsed)
                 if remaining > 0:

@@ -790,7 +790,7 @@ class IntelligentRouter:
         weights = []
         miner_list = list(alive_miners.values())
         for m in miner_list:
-            load_factor = 1.0 / (1.0 + m.active_requests)
+            load_factor = 0.5 ** m.active_requests  # Match select_miner's exponential decay
             speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
             weights.append(max(w, 0.001))

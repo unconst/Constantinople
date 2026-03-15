@@ -68,8 +68,17 @@ from collusion_detector import (
     CollusionDetector, MinerTimingSample, MinerErrorEvent,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hardened_gateway")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_handler)
+log.propagate = False
+
+# Version tracking for watchtower/deployment debugging
+GATEWAY_VERSION = "0.3.0"
+GATEWAY_START_TIME = time.time()
 
 
 # ── Chain Weight Setter ──────────────────────────────────────────────────────
@@ -124,7 +133,7 @@ except Exception as e:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode == 0:
                 miners = json.loads(stdout.decode().strip())
                 self.last_sync = time.time()
@@ -134,7 +143,11 @@ except Exception as e:
                 log.error(f"[METAGRAPH] Discovery failed: {stderr.decode().strip()}")
                 return []
         except asyncio.TimeoutError:
-            log.error("[METAGRAPH] Discovery timed out (30s)")
+            log.error("[METAGRAPH] Discovery timed out (60s)")
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return []
         except Exception as e:
             log.error(f"[METAGRAPH] Discovery error: {e}")
@@ -157,8 +170,8 @@ class ChainWeightSetter:
         self.total_sets = 0
         self.total_failures = 0
 
-    async def set_weights(self, weights: dict[int, float]) -> bool:
-        """Set weights on chain via subprocess. Returns True on success."""
+    async def set_weights(self, weights: dict[int, float], retries: int = 3) -> bool:
+        """Set weights on chain via subprocess with retry. Returns True on success."""
         if not weights:
             log.warning("[CHAIN] No weights to set")
             return False
@@ -188,36 +201,44 @@ except Exception as e:
     sys.exit(1)
 """
 
-        log.info(f"[CHAIN] Setting weights for {len(uids)} miners on netuid {self.netuid}...")
-        log.info(f"[CHAIN] Weights: {dict(zip(uids, [f'{w:.4f}' for w in weight_values]))}")
+        for attempt in range(1 + retries):
+            if attempt > 0:
+                log.info(f"[CHAIN] Retry {attempt}/{retries} for weight setting...")
+                await asyncio.sleep(5)
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            log.info(f"[CHAIN] Setting weights for {len(uids)} miners on netuid {self.netuid}...")
+            log.info(f"[CHAIN] Weights: {dict(zip(uids, [f'{w:.4f}' for w in weight_values]))}")
 
-            if proc.returncode == 0:
-                result = stdout.decode().strip()
-                log.info(f"[CHAIN] Weights set successfully: {result}")
-                self.last_set_time = time.time()
-                self.total_sets += 1
-                return True
-            else:
-                err = stderr.decode().strip()
-                log.error(f"[CHAIN] Weight setting failed: {err}")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+                if proc.returncode == 0:
+                    result = stdout.decode().strip()
+                    log.info(f"[CHAIN] Weights set successfully: {result}")
+                    self.last_set_time = time.time()
+                    self.total_sets += 1
+                    return True
+                else:
+                    err = stderr.decode().strip()
+                    log.error(f"[CHAIN] Weight setting failed: {err}")
+                    self.total_failures += 1
+            except asyncio.TimeoutError:
+                log.error(f"[CHAIN] Weight setting timed out (120s), attempt {attempt + 1}/{1 + retries}")
                 self.total_failures += 1
-                return False
-        except asyncio.TimeoutError:
-            log.error("[CHAIN] Weight setting timed out (60s)")
-            self.total_failures += 1
-            return False
-        except Exception as e:
-            log.error(f"[CHAIN] Weight setting error: {e}")
-            self.total_failures += 1
-            return False
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.error(f"[CHAIN] Weight setting error: {e}")
+                self.total_failures += 1
+
+        return False
 
 
 # ── Real Model for Validator Verification ────────────────────────────────────
@@ -613,9 +634,11 @@ class IntelligentRouter:
     Intelligent request routing across miners.
 
     Routing strategy:
-    1. If session has affinity → prefer that miner (KV cache reuse)
-    2. Otherwise → weighted random by (reliability × speed × availability)
-    3. Fallback → least loaded miner
+    1. Skip miners blocked by scoring (negative points, low pass_rate)
+    2. If session has affinity → prefer that miner (KV cache reuse)
+    3. Otherwise → weighted random by (reliability × speed × availability)
+       where speed = 0.4 * TTFT_score + 0.6 * TPS_score
+    4. Fallback → least loaded miner
 
     Anti-gaming: Routing decisions are not predictable by miners.
     The routing weights use cryptographic randomness and are
@@ -626,32 +649,85 @@ class IntelligentRouter:
         self.miners = miners
         self.session_router = SessionRouter()
         self._reliability_ema_alpha = 0.1  # Slow EMA for reliability
+        self._blocked_uids: set[int] = set()  # UIDs blocked by scoring engine
+        self._auditor_blocked: set[int] = set()  # UIDs blocked by external auditor
+
+    def update_blocked_uids(self, scoring_engine):
+        """Update blocked UIDs from local scoring engine — merges with auditor blocks."""
+        local_blocked = set()
+        for entry in scoring_engine.get_scoreboard():
+            uid = entry["uid"]
+            net_points = entry.get("net_points", 0)
+            pass_rate = entry.get("pass_rate", 1.0)
+            total_challenged = entry.get("passed_challenges", 0) + entry.get("failed_challenges", 0)
+            # Block miners with negative net_points (confirmed cheaters)
+            if net_points < 0:
+                local_blocked.add(uid)
+            # Block miners with low pass_rate and enough samples
+            elif total_challenged >= 4 and pass_rate < 0.7:
+                local_blocked.add(uid)
+        merged = local_blocked | self._auditor_blocked
+        if merged != self._blocked_uids:
+            log.info(f"[ROUTER] Blocked UIDs updated: {merged} (local={local_blocked}, auditor={self._auditor_blocked})")
+        self._blocked_uids = merged
+
+    def update_auditor_blocked(self, blocked_uids: set[int]):
+        """Update blocked UIDs from external auditor — persists across local resets."""
+        self._auditor_blocked = blocked_uids
+        merged = self._blocked_uids | blocked_uids
+        if merged != self._blocked_uids:
+            log.info(f"[ROUTER] Blocked UIDs updated from auditor: {merged}")
+        self._blocked_uids = merged
+
+    def _compute_speed_factor(self, m: MinerInfo) -> float:
+        """Combined speed factor: 40% TTFT + 60% TPS (matches validator scoring)."""
+        # TTFT score: lower is better, normalize to [0, 1]
+        TTFT_EXCELLENT_MS = 200.0
+        TTFT_POOR_MS = 2000.0
+        if m.avg_ttft_ms > 0:
+            ttft_score = max(0.05, min(1.0, 1.0 - (m.avg_ttft_ms - TTFT_EXCELLENT_MS) /
+                                                     (TTFT_POOR_MS - TTFT_EXCELLENT_MS)))
+        else:
+            ttft_score = 0.5  # Unknown TTFT — neutral
+
+        # TPS score: higher is better
+        tps_score = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+
+        return 0.4 * ttft_score + 0.6 * tps_score
 
     def select_miner(self, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select the best miner for a request."""
         # Snapshot to avoid RuntimeError if discovery_loop modifies dict concurrently
-        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive}
+        # Exclude blocked UIDs (negative scorers, low pass_rate)
+        alive_miners = {uid: m for uid, m in list(self.miners.items())
+                        if m.alive and uid not in self._blocked_uids}
+        if not alive_miners:
+            # Fallback: try all alive miners if blocking leaves none
+            alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive}
         if not alive_miners:
             return None
 
-        # Session affinity — only honour if miner is responsive and not overloaded
+        # Session affinity — only honour if miner is responsive, fast, and not overloaded
         if session_id:
             affinity_uid = self.session_router.get_affinity(session_id)
             if affinity_uid is not None and affinity_uid in alive_miners:
                 miner = alive_miners[affinity_uid]
-                # Lower threshold (5 vs 10) to prevent session-locking by slow miners
-                if miner.active_requests < 5 and miner.reliability_score > 0.3:
+                if (miner.active_requests < 5 and
+                    miner.reliability_score > 0.7 and
+                    (miner.avg_ttft_ms <= 0 or miner.avg_ttft_ms < 1000)):
                     return miner
 
-        # Weighted selection based on reliability and load
+        # Weighted selection based on reliability, load, and speed (TTFT + TPS)
+        # Load factor uses exponential decay so heavily loaded miners are deprioritized
+        # faster — this directly improves TTFT for end users.
         weights = []
         miner_list = list(alive_miners.values())
         for m in miner_list:
-            # Weight = reliability × inverse_load × speed_factor
-            load_factor = 1.0 / (1.0 + m.active_requests)
-            speed_factor = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+            load_factor = 0.5 ** m.active_requests  # 1.0, 0.5, 0.25, 0.125, ...
+            speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
-            weights.append(max(w, 0.01))  # Minimum weight to prevent starvation
+            # Only add positive weights — no minimum floor for cheaters
+            weights.append(max(w, 0.001))
 
         total_w = sum(weights)
         if total_w == 0:
@@ -685,9 +761,14 @@ class IntelligentRouter:
         miner.requests_failed += 1
         miner.active_requests = max(0, miner.active_requests - 1)
 
-        # Penalize reliability
-        alpha = self._reliability_ema_alpha
-        miner.reliability_score = miner.reliability_score * (1 - alpha) + 0.0 * alpha
+        # Aggressive decay: use higher alpha for consecutive failures
+        # If miner has never served successfully, mark dead after 3 failures
+        if miner.requests_served == 0 and miner.requests_failed >= 3:
+            miner.reliability_score = 0.0
+        else:
+            # Use 0.3 alpha (3x normal) so dead miners are detected in ~7 failures
+            alpha = 0.3
+            miner.reliability_score = miner.reliability_score * (1 - alpha)
 
         # Mark dead if too unreliable
         if miner.reliability_score < 0.1:
@@ -698,17 +779,21 @@ class IntelligentRouter:
 
     def select_miner_excluding(self, exclude_uids: set, session_id: Optional[str] = None) -> Optional[MinerInfo]:
         """Select a miner excluding specific UIDs (used for failover)."""
-        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in exclude_uids}
+        all_excluded = exclude_uids | self._blocked_uids
+        alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in all_excluded}
+        if not alive_miners:
+            # Fallback: only apply explicit exclusions
+            alive_miners = {uid: m for uid, m in list(self.miners.items()) if m.alive and uid not in exclude_uids}
         if not alive_miners:
             return None
         # Same weighted logic as select_miner but without session affinity
         weights = []
         miner_list = list(alive_miners.values())
         for m in miner_list:
-            load_factor = 1.0 / (1.0 + m.active_requests)
-            speed_factor = max(0.1, min(1.0, m.avg_tps / 100.0)) if m.avg_tps > 0 else 0.5
+            load_factor = 0.5 ** m.active_requests  # Match select_miner's exponential decay
+            speed_factor = self._compute_speed_factor(m)
             w = m.reliability_score * load_factor * speed_factor
-            weights.append(max(w, 0.01))
+            weights.append(max(w, 0.001))
         total_w = sum(weights)
         if total_w == 0:
             return miner_list[0]
@@ -867,8 +952,20 @@ class HardenedGatewayValidator:
         # Metagraph discovery (optional — replaces static --miners)
         self.discovery = metagraph_discovery
 
-        # R2 publisher
-        self.r2 = R2Publisher(local_dir=r2_local_dir or "/tmp/r2-audit")
+        # R2 publisher — prefer real R2 upload via env vars, fall back to local
+        r2_endpoint = os.environ.get("R2_URL", "").rstrip("/")
+        r2_access = os.environ.get("R2_ACCESS_KEY_ID", "")
+        r2_secret = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+        r2_bucket = os.environ.get("R2_BUCKET", "affine")
+        if r2_endpoint and r2_access and r2_secret:
+            self.r2 = R2Publisher(
+                bucket_name=r2_bucket,
+                endpoint_url=r2_endpoint,
+                access_key=r2_access,
+                secret_key=r2_secret,
+            )
+        else:
+            self.r2 = R2Publisher(local_dir=r2_local_dir or "/tmp/r2-audit")
 
         # Build miner pool
         miners = {}
@@ -911,7 +1008,10 @@ class HardenedGatewayValidator:
             )
             self._http_session = aiohttp.ClientSession(
                 connector=connector,
-                timeout=aiohttp.ClientTimeout(total=self.config.INFERENCE_TIMEOUT_S),
+                timeout=aiohttp.ClientTimeout(
+                    total=self.config.INFERENCE_TIMEOUT_S,
+                    connect=5,  # Fast-fail on unreachable miners
+                ),
             )
         return self._http_session
 
@@ -1590,7 +1690,14 @@ class HardenedGatewayValidator:
             # predict the token sequence length from the prompt. Use our own model
             # to generate and get the token count.
             if hasattr(self.model, 'tokenizer'):
-                prompt_tokens = self.model.tokenizer.encode(prompt if not messages else prompt)
+                # When messages are provided, miner applies chat template — use same for estimation
+                if messages and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                    est_prompt = self.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    est_prompt = prompt
+                prompt_tokens = self.model.tokenizer.encode(est_prompt)
                 estimated_seq_len = len(prompt_tokens) + max_tokens
             else:
                 gen_result = self.model.generate(prompt, max_tokens)
@@ -1642,7 +1749,13 @@ class HardenedGatewayValidator:
                 failover_challenge_params = None
                 if should_challenge:
                     if hasattr(self.model, 'tokenizer'):
-                        prompt_tokens = self.model.tokenizer.encode(prompt if not messages else prompt)
+                        if messages and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                            fo_prompt = self.model.tokenizer.apply_chat_template(
+                                messages, tokenize=False, add_generation_prompt=True
+                            )
+                        else:
+                            fo_prompt = prompt
+                        prompt_tokens = self.model.tokenizer.encode(fo_prompt)
                         estimated_seq_len = len(prompt_tokens) + max_tokens
                     else:
                         gen_result = self.model.generate(prompt, max_tokens)
@@ -1736,21 +1849,30 @@ class HardenedGatewayValidator:
             inline_result = result.get("challenge_result")
 
             # Get tokens for reference computation
+            # When messages are provided, the miner applies apply_chat_template,
+            # so we must use the same template-wrapped text for validation.
+            if messages and hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                effective_prompt = self.model.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                effective_prompt = prompt
+
             miner_token_ids = result.get("all_token_ids")
             if miner_token_ids:
-                valid, reason = self._validate_token_ids(miner_token_ids, prompt, response_text)
+                valid, reason = self._validate_token_ids(miner_token_ids, effective_prompt, response_text)
                 if valid:
                     all_tokens = miner_token_ids
                 else:
                     log.warning(f"Miner {miner.uid} token_ids rejected: {reason}")
                     if hasattr(self.model, 'tokenizer'):
-                        full_text = prompt + response_text
+                        full_text = effective_prompt + response_text
                         all_tokens = self.model.tokenizer.encode(full_text)
                     else:
                         gen_result = self.model.generate(prompt, max_tokens)
                         all_tokens = gen_result["all_tokens"]
             elif hasattr(self.model, 'tokenizer'):
-                full_text = prompt + response_text
+                full_text = effective_prompt + response_text
                 all_tokens = self.model.tokenizer.encode(full_text)
             else:
                 gen_result = self.model.generate(prompt, max_tokens)
@@ -1814,6 +1936,11 @@ class HardenedGatewayValidator:
             challenge_passed = challenge_result["passed"]
             cos_sim = challenge_result["cosine_sim"]
             challenge_latency = challenge_result["latency_ms"]
+            log.info(
+                f"[CHALLENGE] Miner {miner.uid}: {'PASS' if challenge_passed else 'FAIL'} | "
+                f"cosine={cos_sim:.4f} latency={challenge_latency:.1f}ms "
+                f"layer={challenge_result.get('layer', '?')} pos={challenge_result.get('token_pos', '?')}"
+            )
 
         # Step 3: Score (Sybil-resistant: use per-miner medians for population ranking)
         medians_ttft, medians_tps = self.scoring.get_miner_medians()
@@ -1836,6 +1963,9 @@ class HardenedGatewayValidator:
             challenge_passed=challenge_passed,
         )
         self.scoring.record_request(score)
+
+        # Update router blocked UIDs after each scored request
+        self.router.update_blocked_uids(self.scoring)
 
         # Track metrics
         self._quality_scores.append(quality)
@@ -2148,7 +2278,7 @@ class HardenedGatewayValidator:
             turn2_ttft_ms=ttft2,
             ttft_ratio=ratio,
             cache_score=compute_cache_score(ratio),
-            challenge_passed=result2["verification"] == 1.0,
+            challenge_passed=result2["verification"] > 0.0,
             turn1_input_tokens=result1["input_tokens"],
             turn2_input_tokens=result2["input_tokens"],
             probe_delay_s=delay,
@@ -2209,7 +2339,12 @@ class HardenedGatewayValidator:
 
             # Set weights on chain if configured
             if self.chain and summary["weights"]:
-                await self.chain.set_weights(summary["weights"])
+                success = await self.chain.set_weights(summary["weights"])
+                summary["weights_committed"] = success
+                if success:
+                    log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
+                else:
+                    log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
 
             return summary
         return None
@@ -2281,6 +2416,7 @@ class HardenedGatewayValidator:
         """Background loop for metagraph-based miner discovery."""
         if not self.discovery:
             return
+        first_run = True
         while True:
             try:
                 miners = await self.discovery.discover_miners()
@@ -2294,6 +2430,25 @@ class HardenedGatewayValidator:
                         if hotkey:
                             self.scoring.register_hotkey(m["uid"], hotkey)
                     self.router.remove_stale_miners(active_uids)
+                    # On first discovery, health-check all miners so dead ones
+                    # don't get routed to before the normal health loop catches them
+                    if first_run:
+                        first_run = False
+                        session = await self._get_http_session()
+                        for uid, miner in list(self.router.miners.items()):
+                            if not miner.alive:
+                                continue
+                            try:
+                                async with session.get(
+                                    f"{miner.endpoint}/health",
+                                    timeout=aiohttp.ClientTimeout(total=5),
+                                ) as resp:
+                                    if resp.status != 200:
+                                        raise Exception(f"HTTP {resp.status}")
+                            except Exception:
+                                miner.alive = False
+                                miner.reliability_score = 0.0
+                                log.info(f"[DISCOVERY] Miner {uid} ({miner.endpoint}): unreachable on first sync, marked DEAD")
                 await asyncio.sleep(self.discovery.sync_interval)
             except asyncio.CancelledError:
                 break
@@ -2497,7 +2652,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             input_tokens=result["input_tokens"],
             output_tokens=result["output_tokens"],
             ttft_ms=result["ttft_ms"],
-            total_ms=result["ttft_ms"],
+            total_ms=result.get("_wall_time_ms", result["ttft_ms"]),
             tokens_per_sec=result["tokens_per_sec"],
         )
 
@@ -2543,35 +2698,68 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
     async def health(request: Request):
         """Health endpoint — always open. Detailed info requires monitoring auth."""
         alive = sum(1 for m in validator.router.miners.values() if m.alive)
+        uptime_s = time.time() - GATEWAY_START_TIME
+        epoch_elapsed = time.time() - validator.scoring.current_epoch_start
+        epoch_length = validator.config.EPOCH_LENGTH_S
+
+        # Get last epoch weights if available
+        last_weights = {}
+        last_epoch_summary = None
+        if validator.epoch_summaries:
+            last_epoch_summary = validator.epoch_summaries[-1]
+            last_weights = last_epoch_summary.get("weights", {})
+
         result = {
             "status": "ok",
+            "version": GATEWAY_VERSION,
+            "uptime_s": int(uptime_s),
             "model": validator.model.config.name,
             "miners_total": len(validator.router.miners),
             "miners_alive": alive,
             "epoch": validator.scoring.epoch_number,
+            "epoch_elapsed_s": int(epoch_elapsed),
+            "epoch_length_s": epoch_length,
             # Public counters — needed by dashboard and monitoring
             "total_organic": validator.total_organic,
             "total_synthetic": validator.total_synthetic,
+            "last_weight_set": validator.chain.last_set_time if validator.chain else 0,
+            "weights": {str(uid): round(w, 4) for uid, w in last_weights.items()},
             "challenges": {
                 "total": validator.challenge_engine.total_challenges,
                 "passed": validator.challenge_engine.total_passed,
                 "failed": validator.challenge_engine.total_failed,
             },
-            "miners_detail": [
-                {
-                    "uid": m.uid,
-                    "alive": m.alive,
-                    "endpoint": m.endpoint,
-                    "reliability": round(m.reliability_score, 3),
-                    "served": m.requests_served,
-                    "failed": m.requests_failed,
-                    "avg_ttft_ms": round(m.avg_ttft_ms, 1),
-                    "avg_tps": round(m.avg_tps, 1),
-                    "active": m.active_requests,
-                }
-                for m in validator.router.miners.values()
-            ],
+            "errors": {
+                "timeouts": validator.total_timeouts,
+                "miner_errors": validator.total_miner_errors,
+                "failovers": validator.total_failovers,
+            },
+            "miners_detail": [],
         }
+
+        # Build per-miner detail with scoring data
+        scoreboard = {s["uid"]: s for s in validator.scoring.get_scoreboard()}
+        for m in validator.router.miners.values():
+            detail = {
+                "uid": m.uid,
+                "alive": m.alive,
+                "endpoint": m.endpoint,
+                "reliability": round(m.reliability_score, 3),
+                "served": m.requests_served,
+                "failed": m.requests_failed,
+                "avg_ttft_ms": round(m.avg_ttft_ms, 1),
+                "avg_tps": round(m.avg_tps, 1),
+                "active": m.active_requests,
+            }
+            # Add scoring data from current epoch
+            if m.uid in scoreboard:
+                sb = scoreboard[m.uid]
+                detail["score"] = round(sb["net_points"], 3)
+                detail["weight"] = round(last_weights.get(m.uid, 0), 4)
+                detail["pass_rate"] = round(sb["pass_rate"], 3)
+                detail["divergence"] = round(sb["divergence"], 3)
+                detail["is_suspect"] = sb["is_suspect"]
+            result["miners_detail"].append(detail)
 
         # Extended info for authenticated monitoring requests
         is_authed = False
@@ -2849,7 +3037,13 @@ async def _stream_response(
     challenge_params = None
     if should_challenge:
         if hasattr(validator.model, 'tokenizer'):
-            prompt_tokens = validator.model.tokenizer.encode(prompt if not messages else prompt)
+            if messages and hasattr(validator.model.tokenizer, 'apply_chat_template'):
+                st_est_prompt = validator.model.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                st_est_prompt = prompt
+            prompt_tokens = validator.model.tokenizer.encode(st_est_prompt)
             estimated_seq_len = len(prompt_tokens) + max_tokens
         else:
             gen_result = validator.model.generate(prompt, max_tokens)
@@ -3063,9 +3257,17 @@ async def _stream_response(
                 inline_result = final_meta.get("challenge_result")
 
                 # Get tokens for reference computation
+                # When messages are provided, use chat template for correct token alignment
+                if messages and hasattr(validator.model, 'tokenizer') and hasattr(validator.model.tokenizer, 'apply_chat_template'):
+                    st_eff_prompt = validator.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    st_eff_prompt = prompt
+
                 miner_token_ids = all_token_ids
                 if miner_token_ids:
-                    valid, reason = validator._validate_token_ids(miner_token_ids, prompt, all_text)
+                    valid, reason = validator._validate_token_ids(miner_token_ids, st_eff_prompt, all_text)
                     if valid:
                         all_tokens = miner_token_ids
                     else:
@@ -3077,7 +3279,7 @@ async def _stream_response(
                 # Fallback: validator produces token IDs if miner didn't (or they were rejected)
                 if not all_tokens:
                     if hasattr(validator.model, 'tokenizer'):
-                        full_text = prompt + all_text
+                        full_text = st_eff_prompt + all_text
                         all_tokens = validator.model.tokenizer.encode(full_text)
                     elif all_text:
                         gen_result = validator.model.generate(prompt, max_tokens)
@@ -3132,6 +3334,9 @@ async def _stream_response(
                 challenge_passed=challenge_passed,
             )
             validator.scoring.record_request(score)
+
+            # Update router blocked UIDs after each scored request
+            validator.router.update_blocked_uids(validator.scoring)
 
             # Publish audit record (parity with non-streaming path)
             audit = AuditRecord(
@@ -3253,6 +3458,11 @@ async def run_gateway(args):
         log.warning("Using mock model — disabling hidden state challenges (speed-only scoring)")
         config.CHALLENGE_RATE = 0.0
 
+    # Override challenge rate if specified
+    if args.challenge_rate is not None:
+        config.CHALLENGE_RATE = max(0.0, min(1.0, args.challenge_rate))
+        log.info(f"Challenge rate set to {config.CHALLENGE_RATE:.1%}")
+
     # Chain integration (optional)
     chain = None
     if args.wallet:
@@ -3284,6 +3494,82 @@ async def run_gateway(args):
         metagraph_discovery=discovery,
     )
 
+    # Set up auditor polling for external challenge data (split architecture)
+    auditor_url = getattr(args, 'auditor_url', None)
+
+    async def auditor_poll_loop():
+        """Periodically fetch challenge data from external audit_validator."""
+        if not auditor_url:
+            return
+        import aiohttp
+        log.info(f"[AUDITOR-POLL] Polling {auditor_url}/v1/scoreboard for challenge data")
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{auditor_url}/v1/scoreboard", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            blocked = set()
+                            for m in data.get("miners", []):
+                                uid = m["uid"]
+                                net_points = m.get("net_points", 0)
+                                pass_rate = m.get("pass_rate", 1.0)
+                                requests = m.get("requests", 0)
+                                # Block miners with negative net_points and enough samples
+                                if requests >= 3 and net_points < 0:
+                                    blocked.add(uid)
+                                # Block miners with very low pass_rate AND negative score
+                                elif requests >= 8 and pass_rate < 0.3 and net_points <= 0:
+                                    blocked.add(uid)
+                            validator.router.update_auditor_blocked(blocked)
+            except Exception as e:
+                log.debug(f"[AUDITOR-POLL] Error: {e}")
+            await asyncio.sleep(30)
+
+    # ── Pre-flight: poll auditor + health-check miners BEFORE accepting traffic ──
+    if auditor_url:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{auditor_url}/v1/scoreboard",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        blocked = set()
+                        for m in data.get("miners", []):
+                            uid = m["uid"]
+                            net_pts = m.get("net_points", 0)
+                            pr = m.get("pass_rate", 1.0)
+                            reqs = m.get("requests", 0)
+                            if reqs >= 3 and net_pts < 0:
+                                blocked.add(uid)
+                            elif reqs >= 8 and pr < 0.3 and net_pts <= 0:
+                                blocked.add(uid)
+                        validator.router.update_auditor_blocked(blocked)
+                        log.info(f"[STARTUP] Pre-loaded auditor blocked UIDs: {blocked}")
+        except Exception as e:
+            log.warning(f"[STARTUP] Could not pre-load auditor data: {e}")
+
+    # Quick health-check all static miners — mark unreachable ones dead immediately
+    import aiohttp as _aiohttp
+    async def _startup_health_check():
+        async with _aiohttp.ClientSession() as session:
+            for uid, miner in list(validator.router.miners.items()):
+                try:
+                    async with session.get(
+                        f"{miner.endpoint}/health",
+                        timeout=_aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                except Exception:
+                    miner.alive = False
+                    miner.reliability_score = 0.0
+                    log.info(f"[STARTUP] Miner {uid} ({miner.endpoint}): unreachable, marked DEAD")
+    await _startup_health_check()
+
     app = create_gateway_app(validator)
 
     uvi_config = uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning")
@@ -3294,7 +3580,7 @@ async def run_gateway(args):
 
     async def main_loop():
         await asyncio.sleep(1)
-        log.info(f"Hardened Gateway running on port {args.port}")
+        log.info(f"Hardened Gateway v{GATEWAY_VERSION} running on port {args.port}")
         log.info(f"Miners: {args.miners}")
         log.info(f"Epoch: {args.epoch_length}s | Synthetic interval: ~{args.synthetic_interval}s (with jitter)")
         if config.API_KEYS:
@@ -3319,8 +3605,9 @@ async def run_gateway(args):
         cross_task = asyncio.create_task(validator.cross_probe_loop())
         health_task = asyncio.create_task(validator.health_recovery_loop())
         discovery_task = asyncio.create_task(validator.discovery_loop())
+        auditor_task = asyncio.create_task(auditor_poll_loop())
 
-        tasks = [synth_task, epoch_task, cache_task, cross_task, health_task, discovery_task]
+        tasks = [synth_task, epoch_task, cache_task, cross_task, health_task, discovery_task, auditor_task]
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -3706,12 +3993,14 @@ def main():
     parser.add_argument("--api-keys", default="", help="Comma-separated API keys (empty = no auth)")
     parser.add_argument("--monitoring-keys", default="", help="Comma-separated monitoring API keys (empty = open)")
     parser.add_argument("--model", default=None, help="HuggingFace model name for verification (default: mock)")
+    parser.add_argument("--challenge-rate", type=float, default=None, help="Challenge rate 0.0-1.0 (default: 1.0 with model, 0.0 without)")
     # Chain integration (optional — omit --wallet to run without chain)
     parser.add_argument("--wallet", default=None, help="Bittensor wallet name (enables chain weight-setting)")
     parser.add_argument("--hotkey", default="default", help="Bittensor hotkey name")
     parser.add_argument("--netuid", type=int, default=1, help="Subnet UID")
     parser.add_argument("--network", default="finney", help="Bittensor network (finney/test/local/ws://...)")
     parser.add_argument("--wallet-path", default=None, help="Wallet directory path")
+    parser.add_argument("--auditor-url", default=None, help="External audit_validator URL to fetch challenge data for routing")
     args = parser.parse_args()
 
     if not args.miners and not args.discover:
