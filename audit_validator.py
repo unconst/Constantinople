@@ -1168,7 +1168,23 @@ class AuditValidator:
                 "latency_ms": CHALLENGE_TIMEOUT_HARD_MS + 5000,
                 "cosine_sim": 0.0,
             }
+        except (aiohttp.ClientConnectorError, ConnectionError, OSError) as e:
+            # Connection errors (miner unreachable/crashed) are NOT cheating — void them.
+            # Only genuine challenge failures (bad cosine, wrong hidden state) should
+            # be penalized. Penalizing connectivity issues causes unfair weight loss
+            # during brief outages (e.g. miner restart) and slow recovery.
+            log.info(
+                f"[AUDIT] Miner {miner_uid}: VOID (connection error) | "
+                f"reason={e}"
+            )
+            challenge_result = {
+                "passed": None,  # Void — not counted as pass or fail
+                "reason": f"connection_error: {e}",
+                "latency_ms": 0.0,
+                "cosine_sim": 0.0,
+            }
         except Exception as e:
+            # Unknown errors still fail — could be protocol-level cheating
             challenge_result = {
                 "passed": False,
                 "reason": str(e),
@@ -1184,10 +1200,15 @@ class AuditValidator:
         # Track successful deferred challenge in diagnostic counter (no penalty impact)
         self._deferred_challenge_counts[miner_uid] += 1
 
+        # Connection-error voids: skip scoring entirely — miner was unreachable,
+        # not cheating. No penalty, no audit count, no challenge rate update.
+        challenge_passed = challenge_result["passed"]
+        if challenge_passed is None:
+            return challenge_result
+
         # Record score — with RTT-corrected timing defense
         ttft_ms = record.get("ttft_ms", 0)
         tps = record.get("tokens_per_sec", 0)
-        challenge_passed = challenge_result["passed"]
         cos_sim = challenge_result["cosine_sim"]
         raw_latency = challenge_result["latency_ms"]
 
