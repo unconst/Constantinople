@@ -2303,35 +2303,41 @@ class HardenedGatewayValidator:
         if self.scoring.should_end_epoch():
             summary = self.scoring.end_epoch()
 
-            # Analyze collusion pairs once — reuse for summary and penalties (avoids 3× O(n^2))
-            collusion_scores = self.collusion_detector.analyze_all_pairs()
+            # Collusion/cache analysis is best-effort — failures must not block weight-setting
+            try:
+                collusion_scores = self.collusion_detector.analyze_all_pairs()
+                summary["kv_cache"] = self.cache_prober.summary()
+                summary["collusion"] = self.collusion_detector.summary(cached_scores=collusion_scores)
 
-            # Attach cache and collusion data to epoch summary
-            summary["kv_cache"] = self.cache_prober.summary()
-            summary["collusion"] = self.collusion_detector.summary(cached_scores=collusion_scores)
-
-            # Apply cache and collusion weight adjustments
-            cache_adj = self.cache_prober.get_cache_weight_adjustments()
-            collusion_penalties = self.collusion_detector.get_weight_penalties(cached_scores=collusion_scores)
-            if summary["weights"]:
-                adjusted = {}
-                for uid, w in summary["weights"].items():
-                    adj = cache_adj.get(uid, 1.0)
-                    col = collusion_penalties.get(uid, 1.0)
-                    adjusted[uid] = w * adj * col
-                # Re-normalize
-                total = sum(adjusted.values())
-                if total > 0:
-                    summary["weights"] = {uid: w / total for uid, w in adjusted.items()}
+                cache_adj = self.cache_prober.get_cache_weight_adjustments()
+                collusion_penalties = self.collusion_detector.get_weight_penalties(cached_scores=collusion_scores)
+                if summary["weights"]:
+                    adjusted = {}
+                    for uid, w in summary["weights"].items():
+                        adj = cache_adj.get(uid, 1.0)
+                        col = collusion_penalties.get(uid, 1.0)
+                        adjusted[uid] = w * adj * col
+                    total = sum(adjusted.values())
+                    if total > 0:
+                        summary["weights"] = {uid: w / total for uid, w in adjusted.items()}
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] Collusion/cache analysis failed (weights unaffected): {e}")
 
             # Reset prober and detector for next epoch
-            self.cache_prober.reset()
-            self.collusion_detector.reset()
+            try:
+                self.cache_prober.reset()
+                self.collusion_detector.reset()
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] Prober/detector reset failed: {e}")
 
             self.epoch_summaries.append(summary)
             if len(self.epoch_summaries) > 100:
                 self.epoch_summaries = self.epoch_summaries[-100:]
-            self.r2.publish_epoch_summary(summary)
+
+            try:
+                self.r2.publish_epoch_summary(summary)
+            except Exception as e:
+                log.error(f"[EPOCH {summary['epoch']}] R2 publish failed: {e}")
 
             log.info(f"\n{'='*60}")
             log.info(f"EPOCH {summary['epoch']} COMPLETE")
@@ -2344,20 +2350,24 @@ class HardenedGatewayValidator:
                     f"pass_rate={info['pass_rate']:.1%} "
                     f"div={info['divergence']:.3f}{suspect}"
                 )
-            cache_info = summary["kv_cache"]
-            log.info(f"  KV Cache: {cache_info['total_probes']} probes, {cache_info['total_cache_hits']} hits")
-            collusion_info = summary["collusion"]
-            log.info(f"  Collusion: {collusion_info['total_pairs_analyzed']} pairs, {collusion_info['flagged_pairs']} flagged")
+            cache_info = summary.get("kv_cache", {})
+            log.info(f"  KV Cache: {cache_info.get('total_probes', 0)} probes, {cache_info.get('total_cache_hits', 0)} hits")
+            collusion_info = summary.get("collusion", {})
+            log.info(f"  Collusion: {collusion_info.get('total_pairs_analyzed', 0)} pairs, {collusion_info.get('flagged_pairs', 0)} flagged")
             log.info(f"{'='*60}\n")
 
-            # Set weights on chain if configured
+            # Set weights on chain — this is the critical path, must always execute
             if self.chain and summary["weights"]:
-                success = await self.chain.set_weights(summary["weights"])
-                summary["weights_committed"] = success
-                if success:
-                    log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
-                else:
-                    log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
+                try:
+                    success = await self.chain.set_weights(summary["weights"])
+                    summary["weights_committed"] = success
+                    if success:
+                        log.info(f"[EPOCH {summary['epoch']}] Weights committed to chain successfully")
+                    else:
+                        log.error(f"[EPOCH {summary['epoch']}] Failed to commit weights to chain")
+                except Exception as e:
+                    log.error(f"[EPOCH {summary['epoch']}] Weight-setting exception: {e}")
+                    summary["weights_committed"] = False
 
             return summary
         return None
