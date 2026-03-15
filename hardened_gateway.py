@@ -199,7 +199,16 @@ try:
         wait_for_finalization=True,
         period=None,
     )
-    print(f"OK:{{response}}")
+    # response is (bool, message) — check success flag
+    if isinstance(response, (tuple, list)):
+        success, msg = response[0], response[1] if len(response) > 1 else ""
+        if success:
+            print(f"OK:{{response}}")
+        else:
+            print(f"ERR:set_weights returned False: {{msg}}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"OK:{{response}}")
 except Exception as e:
     print(f"ERR:{{e}}", file=sys.stderr)
     sys.exit(1)
@@ -3535,12 +3544,21 @@ async def run_gateway(args):
                                 # The gateway's own scorer sees challenge_passed=None for
                                 # all deferred requests, so without this sync, every miner
                                 # hits the "zero challenges" 0.05x weight penalty.
+                                # FIX: Use max() instead of overwrite. The auditor's epoch
+                                # may reset mid-gateway-epoch, dropping counts to 0.
+                                # We keep the highest counts seen during this gateway epoch.
                                 auditor_passed = m.get("passed_challenges", 0)
                                 auditor_failed = m.get("failed_challenges", 0)
                                 if auditor_passed + auditor_failed > 0:
                                     stats = validator.scoring._get_stats(uid)
-                                    stats.passed_challenges = auditor_passed
-                                    stats.failed_challenges = auditor_failed
+                                    stats.passed_challenges = max(stats.passed_challenges, auditor_passed)
+                                    stats.failed_challenges = max(stats.failed_challenges, auditor_failed)
+                                # Sync cosine data from auditor for TPS bonus damping
+                                auditor_cosine = m.get("avg_cosine", 0.0)
+                                if auditor_cosine > 0 and (auditor_passed + auditor_failed > 0):
+                                    stats = validator.scoring._get_stats(uid)
+                                    if not stats.cosine_values or auditor_cosine > stats.avg_cosine:
+                                        stats.cosine_values = [auditor_cosine]
                             validator.router.update_auditor_blocked(blocked)
             except Exception as e:
                 log.debug(f"[AUDITOR-POLL] Error: {e}")
