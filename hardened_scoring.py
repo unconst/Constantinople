@@ -109,7 +109,8 @@ NEW_MINER_CHALLENGE_RATE = 0.9    # Rate for miners with < MIN_CHALLENGES_FOR_TR
 MIN_CHALLENGES_FOR_TRUST = 10     # Need this many passes before rate decays
 SUSPECT_CHALLENGE_RATE = 1.0      # Always challenge suspects
 POST_FAIL_BOOST_COUNT = 5         # Challenge at 100% for this many requests after a fail
-CHALLENGE_RATE_FLOOR = 0.05       # Never go below 5% even for highly trusted miners
+CHALLENGE_RATE_FLOOR = 0.10       # Never go below 10% even for highly trusted miners
+MIN_CHALLENGES_PER_EPOCH = 5      # Every miner must face at least this many challenges per epoch
 
 
 @dataclass
@@ -516,6 +517,10 @@ class HardenedScoringEngine:
         self._clean_streak: dict[int, int] = {}
         # uid → remaining boosted challenges after a failure
         self._post_fail_boost: dict[int, int] = {}
+        # uid → challenges issued this epoch (resets each epoch)
+        self._epoch_challenge_count: dict[int, int] = {}
+        # uid → requests seen this epoch (resets each epoch)
+        self._epoch_request_count: dict[int, int] = {}
 
         # Cache miss rates (set by auditor) — uid → (misses, total_attempts)
         self._cache_miss_rates: dict[int, tuple[int, int]] = {}
@@ -569,7 +574,10 @@ class HardenedScoringEngine:
         - Post-failure boost: 100% for POST_FAIL_BOOST_COUNT challenges
         - New miners (< MIN_CHALLENGES_FOR_TRUST passes): 90%
         - Trusted miners: base_rate / sqrt(clean_streak / MIN_CHALLENGES_FOR_TRUST)
-          decaying from 30% down to floor of 5%
+          decaying from 30% down to floor of 10%
+        - Epoch minimum enforcement: if a miner has had fewer than
+          MIN_CHALLENGES_PER_EPOCH challenges this epoch, rate is boosted to
+          ensure the minimum is met.
 
         Returns a float in [CHALLENGE_RATE_FLOOR, 1.0].
         """
@@ -591,15 +599,31 @@ class HardenedScoringEngine:
 
         # Trusted miners: decaying rate based on clean streak
         # rate = base / sqrt(streak / min_trust) — e.g.:
-        #   10 passes → 0.30, 40 passes → 0.15, 90 passes → 0.10, 360 passes → 0.05
+        #   10 passes → 0.30, 40 passes → 0.15, 90 passes → 0.10
         rate = BASE_CHALLENGE_RATE / math.sqrt(clean / MIN_CHALLENGES_FOR_TRUST)
-        return max(CHALLENGE_RATE_FLOOR, min(1.0, rate))
+        rate = max(CHALLENGE_RATE_FLOOR, min(1.0, rate))
+
+        # Epoch minimum enforcement: if we haven't hit the per-epoch minimum
+        # for this miner, boost the rate to catch up. This prevents a miner
+        # from exploiting a low adaptive rate to avoid most challenges.
+        epoch_challenges = self._epoch_challenge_count.get(uid, 0)
+        epoch_requests = self._epoch_request_count.get(uid, 0)
+        if epoch_challenges < MIN_CHALLENGES_PER_EPOCH and epoch_requests > 0:
+            # How many requests remain (estimate based on epoch progress)?
+            # Conservative: assume at least 20 more requests will come.
+            remaining_est = max(20, epoch_requests)
+            needed = MIN_CHALLENGES_PER_EPOCH - epoch_challenges
+            boost_rate = needed / remaining_est
+            rate = max(rate, boost_rate)
+
+        return rate
 
     def record_challenge_outcome(self, uid: int, passed: bool):
         """
         Update cross-epoch clean streak tracking for adaptive challenge rates.
         Call this after every challenge (pass or fail).
         """
+        self._epoch_challenge_count[uid] = self._epoch_challenge_count.get(uid, 0) + 1
         if passed:
             self._clean_streak[uid] = self._clean_streak.get(uid, 0) + 1
             # Decrement post-fail boost counter
@@ -611,6 +635,10 @@ class HardenedScoringEngine:
             # Failure resets clean streak and activates boost
             self._clean_streak[uid] = 0
             self._post_fail_boost[uid] = POST_FAIL_BOOST_COUNT
+
+    def record_request_seen(self, uid: int):
+        """Track requests per miner per epoch for minimum challenge enforcement."""
+        self._epoch_request_count[uid] = self._epoch_request_count.get(uid, 0) + 1
 
     def get_all_challenge_rates(self) -> dict[int, float]:
         """Get challenge rates for all known miners (for monitoring/logging)."""
@@ -849,49 +877,55 @@ class HardenedScoringEngine:
 
             # Divergence penalty (per-epoch)
             # Compares organic vs synthetic speed scores. Infrastructure noise causes
-            # high divergence for ALL miners (6-14x) regardless of honesty. Only penalize
-            # when pass_rate is significantly below 1.0 (multiple genuine failures),
-            # not from a single transient failure. At pass_rate>=0.90, divergence is
-            # much more likely infrastructure effects than selective throttling.
+            # high divergence for ALL miners (6-14x) regardless of honesty. Use a
+            # graduated penalty that scales with failure rate rather than a hard cliff.
+            # At pass_rate>=0.97, no penalty (noise). At pass_rate<0.80, full penalty.
+            # Between 0.80-0.97, linearly interpolated penalty fraction.
             pr = stats.pass_rate
             div = stats.divergence
-            if pr < 0.90:
+            # Graduated: penalty_scale goes from 0 at pr>=0.97 to 1.0 at pr<=0.80
+            div_penalty_scale = max(0.0, min(1.0, (0.97 - pr) / 0.17)) if div > DIVERGENCE_THRESHOLD else 0.0
+            if div_penalty_scale > 0:
                 if div > 0.25:
-                    weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
+                    actual_penalty = DIVERGENCE_PENALTY_SEVERE * div_penalty_scale
+                    weight *= (1.0 - actual_penalty)
                     if uid not in self._divergence_warned:
-                        log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} → -70% weight")
+                        log.warning(f"Miner {uid}: SEVERE divergence={div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight (scale={div_penalty_scale:.2f})")
                         self._divergence_warned.add(uid)
                 elif div > DIVERGENCE_THRESHOLD:
-                    weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
+                    actual_penalty = DIVERGENCE_PENALTY_MILD * div_penalty_scale
+                    weight *= (1.0 - actual_penalty)
                     if uid not in self._divergence_warned:
-                        log.warning(f"Miner {uid}: mild divergence={div:.3f} → -30% weight")
+                        log.warning(f"Miner {uid}: mild divergence={div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight (scale={div_penalty_scale:.2f})")
                         self._divergence_warned.add(uid)
             elif div > DIVERGENCE_THRESHOLD:
-                # pass_rate>=0.90: miner mostly passes challenges, divergence is likely
-                # infrastructure noise (Cloudflare proxy, concurrency, network hops).
-                # Only log once, no weight penalty.
+                # pass_rate>=0.97: miner overwhelmingly passes challenges, divergence is
+                # infrastructure noise. Only log once, no weight penalty.
                 if uid not in self._divergence_warned:
                     log.info(f"Miner {uid}: divergence={div:.3f} but pass_rate={pr:.0%} — monitoring only")
                     self._divergence_warned.add(uid)
 
             # Cross-epoch divergence: catches miners staying under per-epoch sample minimums
-            # Same policy as per-epoch: only penalize at pr<0.90 (multiple genuine failures).
+            # Same graduated policy as per-epoch divergence.
             cross = self._cross_epoch_scores.get(uid)
             if cross and len(cross["organic"]) >= MIN_ORGANIC_SAMPLES and len(cross["synthetic"]) >= MIN_SYNTHETIC_SAMPLES:
                 cross_org_mean = sum(cross["organic"]) / len(cross["organic"])
                 cross_syn_mean = sum(cross["synthetic"]) / len(cross["synthetic"])
                 if cross_syn_mean > 0:
                     cross_div = abs(cross_org_mean - cross_syn_mean) / max(cross_syn_mean, 0.001)
-                    if pr < 0.90:
+                    cross_div_scale = max(0.0, min(1.0, (0.97 - pr) / 0.17)) if cross_div > DIVERGENCE_THRESHOLD else 0.0
+                    if cross_div_scale > 0:
                         if cross_div > 0.25:
-                            weight *= (1.0 - DIVERGENCE_PENALTY_SEVERE)
+                            actual_penalty = DIVERGENCE_PENALTY_SEVERE * cross_div_scale
+                            weight *= (1.0 - actual_penalty)
                             if uid not in self._cross_div_warned:
-                                log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} → -70% weight")
+                                log.warning(f"Miner {uid}: SEVERE cross-epoch divergence={cross_div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight")
                                 self._cross_div_warned.add(uid)
                         elif cross_div > DIVERGENCE_THRESHOLD:
-                            weight *= (1.0 - DIVERGENCE_PENALTY_MILD)
+                            actual_penalty = DIVERGENCE_PENALTY_MILD * cross_div_scale
+                            weight *= (1.0 - actual_penalty)
                             if uid not in self._cross_div_warned:
-                                log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} → -30% weight")
+                                log.warning(f"Miner {uid}: mild cross-epoch divergence={cross_div:.3f} pr={pr:.0%} → -{actual_penalty:.0%} weight")
                                 self._cross_div_warned.add(uid)
                     elif cross_div > DIVERGENCE_THRESHOLD:
                         if uid not in self._cross_div_warned:
@@ -1056,6 +1090,8 @@ class HardenedScoringEngine:
         self._cache_miss_rates = {}  # Fresh per-epoch cache miss evaluation
         self._divergence_warned = set()   # Reset log-spam guards
         self._cross_div_warned = set()
+        self._epoch_challenge_count = {}  # Reset per-epoch challenge counts
+        self._epoch_request_count = {}    # Reset per-epoch request counts
 
         # Update suspect history BEFORE computing weights so that first-time
         # suspects get the history penalty in the same epoch they're flagged.

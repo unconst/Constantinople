@@ -1835,6 +1835,9 @@ class AuditValidator:
                 except Exception as e:
                     log.warning(f"[SYNTH] R2 publish failed: {e}")
 
+                # Track request for per-epoch minimum challenge enforcement
+                self.scoring.record_request_seen(uid)
+
                 # Adaptive challenge: use per-miner rate to decide whether to audit.
                 # If yes, DEFER the challenge (Vector 29) — push to queue so the
                 # /hidden_state request arrives 30-180s later, breaking the
