@@ -106,8 +106,13 @@ class ChallengeEngine:
         """
         challenge_id = secrets.token_hex(16)
 
+        # Exclude last 2 layers — CPU float32 vs GPU float16 divergence at
+        # deep transformer layers causes false failures (cosine < 0.1).
+        # Layer 27 (last) is worst; layer 26 also diverges significantly.
+        safe_layers = max(num_layers - 2, 1)
+
         # Primary challenge point
-        layer_index = secrets.randbelow(num_layers)
+        layer_index = secrets.randbelow(safe_layers)
         token_index = secrets.randbelow(max(seq_len, 1))
 
         # Decide if multi-point based on cryptographic coin flip
@@ -115,7 +120,7 @@ class ChallengeEngine:
         if secrets.randbelow(100) < int(self.multi_point_probability * 100):
             for _ in range(self.num_extra_points):
                 extra_points.append((
-                    secrets.randbelow(num_layers),
+                    secrets.randbelow(safe_layers),
                     secrets.randbelow(max(seq_len, 1)),
                 ))
             challenge_type = "multi_point"

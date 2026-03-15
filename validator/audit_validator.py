@@ -1121,13 +1121,16 @@ class AuditValidator:
                                 )
 
                                 # Void mid-range cosine: likely computational divergence, not cheating.
-                                # Uniform 0.05 threshold — TP=2 multi-GPU inference causes cosine
-                                # to drop to 0.1-0.2 even for honest miners. Cheaters produce < 0.03.
+                                # Deep layers (>=20) diverge more between CPU/GPU, so use a lower
+                                # void threshold. Cheaters fail ALL layers uniformly (cosine < 0.03).
                                 if not verification.passed:
-                                    void_threshold = 0.05
+                                    if challenge.layer_index >= 20:
+                                        void_threshold = 0.01  # deep layers: void anything above 0.01
+                                    else:
+                                        void_threshold = 0.05  # shallow layers: TP=2 interference
                                     if verification.cosine_sim >= void_threshold:
                                         log.info(
-                                            f"[AUDIT] VOID ({'deep-layer' if challenge.layer_index >= 20 else 'mid-range'} "
+                                            f"[AUDIT] Miner {miner_uid}: VOID ({'deep-layer' if challenge.layer_index >= 20 else 'mid-range'} "
                                             f"cosine={verification.cosine_sim:.4f}) | "
                                             f"layer={challenge.layer_index} pos={challenge.token_index} — "
                                             f"likely computational interference, not cheating"
