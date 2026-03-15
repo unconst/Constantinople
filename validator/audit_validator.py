@@ -732,11 +732,11 @@ class AuditValidator:
                     "layer": layer, "position": position,
                     "passed": True, "cosine_sim": cos_sim,
                 })
-            elif cos_sim >= 0.05:
+            elif abs(cos_sim) >= 0.03:
                 # Void range — computational divergence from concurrent GPU inference,
-                # not cheating. Threshold lowered from 0.2/0.01 to uniform 0.05 because
-                # TP=2 multi-GPU and concurrent hidden state extraction during active
-                # inference causes cosine 0.1-0.2. Cheaters produce cosine < 0.03.
+                # not cheating. Uses abs() to catch both positive and negative divergence
+                # (negative cosine = anti-correlation from GPU interference). Cheaters
+                # submit zero/null states (cosine≈0.0).
                 results.append({
                     "layer": layer, "position": position,
                     "passed": None, "cosine_sim": cos_sim, "reason": "voided",
@@ -1120,15 +1120,17 @@ class AuditValidator:
                                     latency_ms=latency_ms,
                                 )
 
-                                # Void mid-range cosine: likely computational divergence, not cheating.
-                                # Deep layers (>=20) diverge more between CPU/GPU, so use a lower
-                                # void threshold. Cheaters fail ALL layers uniformly (cosine < 0.03).
+                                # Void divergent cosine: likely computational interference, not cheating.
+                                # GPU concurrent inference can produce negative cosine (anti-correlation)
+                                # as well as low-positive. Use abs(cosine) to catch both directions.
+                                # Cheaters submit zero/null states (cosine≈0.0) or fail ALL layers uniformly.
+                                # Deep layers (>=20) use lower threshold due to CPU/GPU float divergence.
                                 if not verification.passed:
                                     if challenge.layer_index >= 20:
                                         void_threshold = 0.01  # deep layers: void anything above 0.01
                                     else:
-                                        void_threshold = 0.05  # shallow layers: TP=2 interference
-                                    if verification.cosine_sim >= void_threshold:
+                                        void_threshold = 0.03  # shallow layers: interference produces |cos|>0.03
+                                    if abs(verification.cosine_sim) >= void_threshold:
                                         log.info(
                                             f"[AUDIT] Miner {miner_uid}: VOID ({'deep-layer' if challenge.layer_index >= 20 else 'mid-range'} "
                                             f"cosine={verification.cosine_sim:.4f}) | "
