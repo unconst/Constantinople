@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("r2-publisher")
+log.propagate = False
 
 
 class AuditRecord:

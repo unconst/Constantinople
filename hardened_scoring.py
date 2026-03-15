@@ -26,6 +26,12 @@ from dataclasses import dataclass, field
 import numpy as np
 
 log = logging.getLogger("hardened_scoring")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_handler)
+log.propagate = False
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -1119,6 +1125,8 @@ class HardenedScoringEngine:
                 "divergence": stats.divergence,
                 "consistency": stats.consistency_score,
                 "pass_rate": stats.pass_rate,
+                "passed_challenges": stats.passed_challenges,
+                "failed_challenges": stats.failed_challenges,
                 "is_suspect": stats.is_suspect,
                 "avg_ttft_ms": stats.avg_ttft_ms,
                 "avg_tps": stats.avg_tps,

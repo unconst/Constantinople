@@ -52,6 +52,7 @@ from typing import Callable
 import numpy as np
 
 log = logging.getLogger("collusion_detector")
+log.propagate = False
 
 
 # ── Configuration ────────────────────────────────────────────────────────────

@@ -3498,7 +3498,12 @@ async def run_gateway(args):
     auditor_url = getattr(args, 'auditor_url', None)
 
     async def auditor_poll_loop():
-        """Periodically fetch challenge data from external audit_validator."""
+        """Periodically fetch challenge data from external audit_validator.
+
+        In split architecture, the gateway defers all challenges to the auditor.
+        This loop syncs challenge pass/fail counts back into the gateway's scorer
+        so weight computation doesn't penalize miners for 'zero challenges'.
+        """
         if not auditor_url:
             return
         import aiohttp
@@ -3521,6 +3526,17 @@ async def run_gateway(args):
                                 # Block miners with very low pass_rate AND negative score
                                 elif requests >= 8 and pass_rate < 0.3 and net_points <= 0:
                                     blocked.add(uid)
+
+                                # Sync challenge counts from auditor into gateway scorer.
+                                # The gateway's own scorer sees challenge_passed=None for
+                                # all deferred requests, so without this sync, every miner
+                                # hits the "zero challenges" 0.05x weight penalty.
+                                auditor_passed = m.get("passed_challenges", 0)
+                                auditor_failed = m.get("failed_challenges", 0)
+                                if auditor_passed + auditor_failed > 0:
+                                    stats = validator.scoring._get_stats(uid)
+                                    stats.passed_challenges = auditor_passed
+                                    stats.failed_challenges = auditor_failed
                             validator.router.update_auditor_blocked(blocked)
             except Exception as e:
                 log.debug(f"[AUDITOR-POLL] Error: {e}")

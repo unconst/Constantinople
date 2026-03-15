@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 log = logging.getLogger("kv_cache_prober")
+log.propagate = False
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
