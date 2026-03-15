@@ -49,6 +49,8 @@ class AuditRecord:
         verification_score: float = 0.0,
         quality_score: float = 1.0,
         points_awarded: float = 0.0,
+        messages: list | None = None,
+        **kwargs,
     ):
         self.timestamp = datetime.now(timezone.utc).isoformat()
         self.request_id = request_id
@@ -70,6 +72,7 @@ class AuditRecord:
         self.verification_score = verification_score
         self.quality_score = quality_score
         self.points_awarded = points_awarded
+        self.messages = messages
 
     def to_dict(self) -> dict:
         d = {
@@ -89,6 +92,8 @@ class AuditRecord:
             "quality_score": round(self.quality_score, 4),
             "points_awarded": round(self.points_awarded, 4),
         }
+        if self.messages:
+            d["messages"] = self.messages
         if self.challenge_passed is not None:
             d["challenge"] = {
                 "layer": self.challenge_layer,
@@ -124,12 +129,7 @@ class R2Publisher:
         self.records_published = 0
         self._client = None
 
-        if local_dir:
-            # Local file-based mode for testing
-            Path(local_dir).mkdir(parents=True, exist_ok=True)
-            self._mode = "local"
-            log.info(f"R2Publisher: local mode → {local_dir}")
-        elif endpoint_url and access_key and secret_key:
+        if endpoint_url and access_key and secret_key:
             # Real R2 mode
             try:
                 import boto3
@@ -146,6 +146,11 @@ class R2Publisher:
                 self.local_dir = local_dir or "/tmp/r2-audit"
                 Path(self.local_dir).mkdir(parents=True, exist_ok=True)
                 self._mode = "local"
+        elif local_dir:
+            # Explicit local dir
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            self._mode = "local"
+            log.info(f"R2Publisher: local mode → {local_dir}")
         else:
             # Default: local mode
             self.local_dir = "/tmp/r2-audit"

@@ -236,7 +236,7 @@ class ChallengeEngine:
             extra_results=extra_results,
         )
 
-    def cleanup_expired(self, max_age_s: float = 30.0):
+    def cleanup_expired(self, max_age_s: float = 300.0):
         """Remove expired pending challenges."""
         now = time.time()
         expired = [cid for cid, c in self._pending.items() if now - c.created_at > max_age_s]

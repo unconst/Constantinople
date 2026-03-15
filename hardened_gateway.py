@@ -128,7 +128,7 @@ except Exception as e:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode == 0:
                 miners = json.loads(stdout.decode().strip())
                 self.last_sync = time.time()
@@ -138,7 +138,11 @@ except Exception as e:
                 log.error(f"[METAGRAPH] Discovery failed: {stderr.decode().strip()}")
                 return []
         except asyncio.TimeoutError:
-            log.error("[METAGRAPH] Discovery timed out (30s)")
+            log.error("[METAGRAPH] Discovery timed out (60s)")
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return []
         except Exception as e:
             log.error(f"[METAGRAPH] Discovery error: {e}")
