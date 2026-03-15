@@ -751,9 +751,14 @@ class IntelligentRouter:
         miner.requests_failed += 1
         miner.active_requests = max(0, miner.active_requests - 1)
 
-        # Penalize reliability
-        alpha = self._reliability_ema_alpha
-        miner.reliability_score = miner.reliability_score * (1 - alpha) + 0.0 * alpha
+        # Aggressive decay: use higher alpha for consecutive failures
+        # If miner has never served successfully, mark dead after 3 failures
+        if miner.requests_served == 0 and miner.requests_failed >= 3:
+            miner.reliability_score = 0.0
+        else:
+            # Use 0.3 alpha (3x normal) so dead miners are detected in ~7 failures
+            alpha = 0.3
+            miner.reliability_score = miner.reliability_score * (1 - alpha)
 
         # Mark dead if too unreliable
         if miner.reliability_score < 0.1:
@@ -937,8 +942,20 @@ class HardenedGatewayValidator:
         # Metagraph discovery (optional — replaces static --miners)
         self.discovery = metagraph_discovery
 
-        # R2 publisher
-        self.r2 = R2Publisher(local_dir=r2_local_dir or "/tmp/r2-audit")
+        # R2 publisher — prefer real R2 upload via env vars, fall back to local
+        r2_endpoint = os.environ.get("R2_URL", "").rstrip("/")
+        r2_access = os.environ.get("R2_ACCESS_KEY_ID", "")
+        r2_secret = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+        r2_bucket = os.environ.get("R2_BUCKET", "affine")
+        if r2_endpoint and r2_access and r2_secret:
+            self.r2 = R2Publisher(
+                bucket_name=r2_bucket,
+                endpoint_url=r2_endpoint,
+                access_key=r2_access,
+                secret_key=r2_secret,
+            )
+        else:
+            self.r2 = R2Publisher(local_dir=r2_local_dir or "/tmp/r2-audit")
 
         # Build miner pool
         miners = {}
@@ -981,7 +998,10 @@ class HardenedGatewayValidator:
             )
             self._http_session = aiohttp.ClientSession(
                 connector=connector,
-                timeout=aiohttp.ClientTimeout(total=self.config.INFERENCE_TIMEOUT_S),
+                timeout=aiohttp.ClientTimeout(
+                    total=self.config.INFERENCE_TIMEOUT_S,
+                    connect=5,  # Fast-fail on unreachable miners
+                ),
             )
         return self._http_session
 
@@ -3468,8 +3488,8 @@ async def run_gateway(args):
                                 # Block miners with negative net_points and enough samples
                                 if requests >= 3 and net_points < 0:
                                     blocked.add(uid)
-                                # Block miners with low pass_rate and enough challenges
-                                elif requests >= 4 and pass_rate < 0.7:
+                                # Block miners with very low pass_rate AND negative score
+                                elif requests >= 8 and pass_rate < 0.3 and net_points <= 0:
                                     blocked.add(uid)
                             validator.router.update_auditor_blocked(blocked)
             except Exception as e:

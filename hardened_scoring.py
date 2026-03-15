@@ -918,14 +918,11 @@ class HardenedScoringEngine:
             # Applies starting at 3 requests (not 10) to prevent short-lived Sybil
             # campaigns that serve <10 requests per UID to evade participation checks.
             total_challenged = stats.passed_challenges + stats.failed_challenges
-            if stats.total_requests >= 3:
+            # Only penalize zero-challenge at higher request counts to avoid false
+            # positives with adaptive (low) challenge rates. At 22% rate, P(0 challenges in
+            # 10 requests) = 0.78^10 ≈ 8%, still plausible. At 15 requests ≈ 2%.
+            if stats.total_requests >= 15:
                 if total_challenged == 0:
-                    # RED-TEAM FIX (step 14): Increased from 0.3x to 0.05x.
-                    # Zero challenges means the miner provided ZERO verification
-                    # evidence. At 0.3x, a fast miner with 100% cache miss could
-                    # still earn ~14% weight by accumulating unchallenged points.
-                    # At 0.05x, that drops to ~2% — still nonzero (gives new miners
-                    # a chance to prove themselves) but not exploitable.
                     weight *= 0.05
                     log.warning(f"Miner {uid}: zero challenges out of {stats.total_requests} requests → 0.05x weight")
                 else:
