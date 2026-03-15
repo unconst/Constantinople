@@ -215,9 +215,11 @@ class RealValidatorModel:
     """HuggingFace model for hidden state verification."""
 
     def __init__(self, model_name: str, device: str = "auto"):
+        import threading
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        self._lock = threading.Lock()
         trust_remote = os.getenv("TRUST_REMOTE_CODE", "0") == "1"
         log.info(f"Loading validator model: {model_name} (device={device})")
 
@@ -250,31 +252,35 @@ class RealValidatorModel:
         return next(self.model.parameters()).device
 
     def compute_hidden_state_at(self, tokens: list[int], layer: int, position: int) -> np.ndarray:
-        """Compute hidden state at (layer, position) for verification."""
-        input_ids = self._torch.tensor([tokens[:position + 1]], device=self._device)
-        with self._torch.no_grad():
-            outputs = self.model(input_ids, output_hidden_states=True)
-        vec = outputs.hidden_states[layer + 1][0][-1].cpu().float().numpy()
+        """Compute hidden state at (layer, position) for verification.
+        Thread-safe: serialized via lock to prevent concurrent forward pass corruption."""
+        with self._lock:
+            input_ids = self._torch.tensor([tokens[:position + 1]], device=self._device)
+            with self._torch.no_grad():
+                outputs = self.model(input_ids, output_hidden_states=True)
+            vec = outputs.hidden_states[layer + 1][0][-1].cpu().float().numpy()
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec = vec / norm
         return vec
 
     def compute_hidden_states_batch(self, tokens: list[int], points: list[tuple[int, int]]) -> dict:
-        """Compute hidden states at multiple points in one forward pass."""
+        """Compute hidden states at multiple points in one forward pass.
+        Thread-safe: serialized via lock to prevent concurrent forward pass corruption."""
         if not points:
             return {}
-        max_pos = max(pos for _, pos in points)
-        input_ids = self._torch.tensor([tokens[:max_pos + 1]], device=self._device)
-        with self._torch.no_grad():
-            outputs = self.model(input_ids, output_hidden_states=True)
-        result = {}
-        for layer, pos in points:
-            vec = outputs.hidden_states[layer + 1][0][pos].cpu().float().numpy()
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            result[(layer, pos)] = vec
+        with self._lock:
+            max_pos = max(pos for _, pos in points)
+            input_ids = self._torch.tensor([tokens[:max_pos + 1]], device=self._device)
+            with self._torch.no_grad():
+                outputs = self.model(input_ids, output_hidden_states=True)
+            result = {}
+            for layer, pos in points:
+                vec = outputs.hidden_states[layer + 1][0][pos].cpu().float().numpy()
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                result[(layer, pos)] = vec
         return result
 
 
