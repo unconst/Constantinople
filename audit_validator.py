@@ -2122,17 +2122,20 @@ class AuditValidator:
                 uid = record.get("miner_uid")
                 miner_tps = record.get("tokens_per_sec", 50)
                 if miner_tps > 100:
-                    # Fast miner: delay [3, 15]s (mean ~5s)
+                    # Fast miner: delay [1, 8]s (mean ~2s)
+                    # High-TPS miners cycle LRU cache slots in < 1s at 200 TPS.
+                    # 87% eviction rate at [3,15]s was too long; reduced to
+                    # improve deferred challenge coverage to ~40-50%.
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(15, max(3, -5.0 * math.log(_u)))
+                    target_delay = min(8, max(1, -2.0 * math.log(_u)))
                 elif miner_tps > 50:
-                    # Medium miner: delay [5, 30]s (mean ~10s)
+                    # Medium miner: delay [3, 20]s (mean ~6s)
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(30, max(5, -10.0 * math.log(_u)))
+                    target_delay = min(20, max(3, -6.0 * math.log(_u)))
                 else:
-                    # Slow miner: delay [10, 60]s (mean ~20s)
+                    # Slow miner: delay [5, 40]s (mean ~12s)
                     _u = max(1e-9, secrets.randbelow(10000) / 10000.0)
-                    target_delay = min(60, max(10, -20.0 * math.log(_u)))
+                    target_delay = min(40, max(5, -12.0 * math.log(_u)))
                 elapsed = time.time() - queued_at
                 remaining = max(0, target_delay - elapsed)
                 if remaining > 0:
