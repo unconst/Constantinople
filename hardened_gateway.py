@@ -68,8 +68,13 @@ from collusion_detector import (
     CollusionDetector, MinerTimingSample, MinerErrorEvent,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hardened_gateway")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_handler)
+log.propagate = False
 
 # Version tracking for watchtower/deployment debugging
 GATEWAY_VERSION = "0.3.0"
